@@ -409,10 +409,12 @@ body{display:flex;flex-direction:column}
 .chip.cur{border-color:#ff6d00}
 #plan{margin:2px 12px 8px;padding:8px 10px;background:#161b24;border:1px solid #2b3139;border-radius:8px;font-size:13px;line-height:1.5}
 #plan:empty{display:none}
+.hid{display:none!important}
+.tg{background:#1c212b;color:#d1d4dc;border:1px solid #2b3139;border-radius:6px;padding:4px 9px;font-size:12px;cursor:pointer}
 .chip b{font-size:13px}
 </style></head><body>
 <div id="top"><span id="name">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="tfs"></span>
-<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span></div>
+<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span><span id="hides"><button class="tg" id="b_plan" onclick="toggleBox('hp')">Hide Plan</button> <button class="tg" id="b_sigs" onclick="toggleBox('hs')">Hide Signals</button></span></div>
 <div id="plan"></div>
 <div id="sigs"></div>
 <div style="padding:0 12px 4px;font-size:12px;opacity:.8"><span id="sum"></span> <span id="upd" style="opacity:.7"></span></div>
@@ -449,6 +451,22 @@ TFS.forEach(x => {
 });
 function mark(){ TFS.forEach(x => document.getElementById('tf_' + x).className = (x === tf ? 'on' : '')); }
 mark();
+
+const hideState = {hp: '0', hs: '0'};
+try { hideState.hp = localStorage.getItem('hp') || '0'; hideState.hs = localStorage.getItem('hs') || '0'; } catch(e){}
+function applyHide(){
+  [['hp','plan','Plan'], ['hs','sigs','Signals']].forEach(a => {
+    const off = hideState[a[0]] === '1';
+    document.getElementById(a[1]).classList.toggle('hid', off);
+    document.getElementById('b_' + a[1]).textContent = (off ? 'Show ' : 'Hide ') + a[2];
+  });
+}
+function toggleBox(k){
+  hideState[k] = hideState[k] === '1' ? '0' : '1';
+  try { localStorage.setItem(k, hideState[k]); } catch(e){}
+  applyHide();
+}
+applyHide();
 
 async function loadPlan(){
   try{

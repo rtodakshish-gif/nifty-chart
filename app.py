@@ -43,7 +43,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 LOT = 65                                 # Nifty lot size
 STRIKE_STEP = 50
 SELL_PREMIUM = 200                       # target premium of the option you SELL (Rs)
-HEDGE_PREMIUM = 10                       # target premium of the far-OTM option you BUY (Rs)
+HEDGE_PREMIUM = 35                       # target premium of the far-OTM option you BUY (Rs)
 PREMIUM_SL_PCT = 30                      # stop-loss = sell premium + 30%
 EXPIRY_WEEKDAY = 1                       # 0=Mon,1=Tue ... weekly expiry day (please verify in Kite)
 RISK_FREE, FALLBACK_IV = 0.07, 0.14

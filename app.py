@@ -6,13 +6,14 @@ Time frames: 1m, 5m, 15m, 30m, 1h, 1D (buttons at the top).
 Shows: candles (incl. the running candle), Supertrend(10,3), EMA20, and BUY/SELL signals on EVERY time frame:
   BIG BUY/SELL  = Supertrend flip confirmed by close vs EMA20 (the bot's rule)
   small buy/sell = Supertrend flip without EMA20 confirmation (dim)
-plus a panel with the latest signal of every time frame, and a simulated result (stop-loss %, same-day exit).
+plus a 1h hedged option-selling TRADE PLAN card (manual orders; optional ntfy phone alerts), a panel with the latest signal of every time frame, and a simulated result (stop-loss %, same-day exit).
 Needs: pip install requests pandas numpy      (internet is also needed for the chart library)
 Run:   python nifty_chart_server.py       Stop: Ctrl + C
 Phone on the same WiFi: open the address printed as "Phone" below.
 """
 import datetime as dt
 import json
+import math
 import os
 import socket
 import threading
@@ -37,6 +38,17 @@ HOST = "0.0.0.0"                         # "127.0.0.1" = only this PC; "0.0.0.0"
 SHIFT = 19800                            # show IST (UTC+5:30)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+
+# ---- trade-plan settings (1h hedged option selling; you place orders yourself in Kite) ----
+LOT = 65                                 # Nifty lot size
+STRIKE_STEP = 50
+SELL_PREMIUM = 200                       # target premium of the option you SELL (Rs)
+HEDGE_PREMIUM = 10                       # target premium of the far-OTM option you BUY (Rs)
+PREMIUM_SL_PCT = 30                      # stop-loss = sell premium + 30%
+EXPIRY_WEEKDAY = 1                       # 0=Mon,1=Tue ... weekly expiry day (please verify in Kite)
+RISK_FREE, FALLBACK_IV = 0.07, 0.14
+PLAN_TF = "1h"
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")   # optional phone alerts via ntfy.sh
 
 cache = {}                               # tf -> {"json": str, "t": float}
 lock = threading.Lock()
@@ -125,6 +137,8 @@ def market_status():
 def fmt_sig_time(ts, sec):
     """IST time when the signal candle CLOSED."""
     x = dt.datetime.fromtimestamp(ts + sec + SHIFT, dt.timezone.utc)
+    if sec < 86400 and (x.hour, x.minute) > (15, 30):      # last 1h candle is only 15 min long
+        x = x.replace(hour=15, minute=30)
     return x.strftime("%d-%b") if sec >= 86400 else x.strftime("%d-%b %H:%M")
 
 
@@ -170,6 +184,142 @@ def all_signals():
         except Exception as e:
             out.append(dict(tf=tf, trend=None, signal=None, error=str(e)))
     return out
+
+
+def _ncdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def bs_price(S, K, T, iv, call):
+    """Black-Scholes estimate (flat IV) - only an approximation of the real premium."""
+    if T <= 0:
+        return max(0.0, (S - K) if call else (K - S))
+    d1 = (math.log(S / K) + (RISK_FREE + iv * iv / 2) * T) / (iv * math.sqrt(T))
+    d2 = d1 - iv * math.sqrt(T)
+    if call:
+        return S * _ncdf(d1) - K * math.exp(-RISK_FREE * T) * _ncdf(d2)
+    return K * math.exp(-RISK_FREE * T) * _ncdf(-d2) - S * _ncdf(-d1)
+
+
+def strike_for(S, T, iv, call, target):
+    atm = round(S / STRIKE_STEP) * STRIKE_STEP
+    best = None
+    for k in range(0, 300):
+        K = atm + (k if call else -k) * STRIKE_STEP
+        p = bs_price(S, K, T, iv, call)
+        if best is None or abs(p - target) < abs(best[1] - target):
+            best = (K, p)
+        if p < target * 0.3:
+            break
+    return best
+
+
+vix_cache = {"v": FALLBACK_IV, "t": 0}
+
+
+def get_iv():
+    if time.time() - vix_cache["t"] < 600:
+        return vix_cache["v"]
+    try:
+        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX",
+                         params={"interval": "1d", "range": "5d"}, headers=HEADERS, timeout=10)
+        closes = [c for c in r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"] if c]
+        vix_cache["v"] = closes[-1] / 100.0
+    except Exception:
+        pass
+    vix_cache["t"] = time.time()
+    return vix_cache["v"]
+
+
+def next_expiry(now_ist):
+    add = (EXPIRY_WEEKDAY - now_ist.weekday()) % 7
+    if add == 0 and now_ist.time() >= dt.time(15, 30):
+        add = 7
+    return now_ist.date() + dt.timedelta(days=add)
+
+
+plan_cache = {}
+
+
+def make_plan():
+    """Latest 1h signal + an estimated hedged option-selling plan (you place the orders yourself)."""
+    c = plan_cache.get("p")
+    if c and time.time() - c["t"] < 30:
+        return c["v"]
+    sec = TFS[PLAN_TF][2]
+    df = fetch(PLAN_TF)
+    df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
+    d, _ = supertrend(df)
+    now = int(time.time())
+    n_closed = len(df) - 1 if (market_status() == "OPEN" and df.iloc[-1]["time"] + sec > now) else len(df)
+    flips = find_flips(df, d, n_closed, sec)
+    spot = float(df.close.iloc[-1])
+    out = dict(tf=PLAN_TF, spot=round(spot, 2), trend="GREEN" if d[-1] == 1 else "RED", signal=None, plan=None,
+               lot=LOT)
+    if flips:
+        f = flips[-1]
+        close_ts = int(df.time[f["i"]]) + sec
+        over = (close_ts + SHIFT) % 86400 - (15 * 3600 + 1800)
+        if over > 0:
+            close_ts -= over
+        age = max(0, (now - close_ts) // 60)
+        today = (close_ts + SHIFT) // 86400 == (now + SHIFT) // 86400
+        late = (close_ts + SHIFT) % 86400 >= 15 * 3600 + 900
+        out["signal"] = dict(side="BUY" if f["buy"] else "SELL", ok=f["ok"], price=f["price"], time=f["time"],
+                             age_min=int(age), fresh=bool(f["ok"] and today and age <= 90), late=bool(late))
+        if f["ok"]:
+            call = not f["buy"]                 # SELL signal -> sell CE ; BUY signal -> sell PE
+            now_ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)
+            exp = next_expiry(now_ist)
+            iv = get_iv()
+            atm = round(spot / STRIKE_STEP) * STRIKE_STEP
+            for _ in range(4):                  # nearest expiry too cheap for the target premium -> next week
+                end = dt.datetime.combine(exp, dt.time(15, 30))
+                T = max((end - now_ist.replace(tzinfo=None)).total_seconds() / (365 * 86400), 1 / (365 * 24))
+                if bs_price(spot, atm, T, iv, call) >= SELL_PREMIUM:
+                    break
+                exp += dt.timedelta(days=7)
+            sK, sp = strike_for(spot, T, iv, call, SELL_PREMIUM)
+            hK, hp = strike_for(spot, T, iv, call, HEDGE_PREMIUM)
+            if (call and hK <= sK) or ((not call) and hK >= sK):
+                hK = sK + STRIKE_STEP * (1 if call else -1)
+                hp = bs_price(spot, hK, T, iv, call)
+            sp, hp = round(sp / 5) * 5, max(round(hp / 5) * 5, 5)
+            out["plan"] = dict(kind="CE" if call else "PE", sell_strike=int(sK), sell_prem=sp,
+                               hedge_strike=int(hK), hedge_prem=hp, expiry=exp.strftime("%d-%b-%Y"),
+                               sl_prem=round(sp * (1 + PREMIUM_SL_PCT / 100) / 5) * 5,
+                               max_loss=int(max(0, abs(hK - sK) - (sp - hp)) * LOT),
+                               credit=int((sp - hp) * LOT), iv=round(iv * 100, 1))
+    plan_cache["p"] = {"v": out, "t": time.time()}
+    return out
+
+
+def send_ntfy(p):
+    s, pl = p["signal"], p["plan"]
+    body = (f"{s['side']} signal 1h ({s['time']}) | Nifty {p['spot']}\n"
+            f"SELL {pl['sell_strike']} {pl['kind']} (~Rs {pl['sell_prem']}) + BUY {pl['hedge_strike']} {pl['kind']} "
+            f"(~Rs {pl['hedge_prem']}) | Expiry {pl['expiry']}\n"
+            f"SL: premium Rs {pl['sl_prem']} or 1h Supertrend flip. Check real premiums in Kite.")
+    requests.post("https://ntfy.sh/" + NTFY_TOPIC, data=body.encode("utf-8"), timeout=10,
+                  headers={"Title": "NIFTY 1h signal", "Priority": "high", "Tags": "chart_with_upwards_trend"})
+
+
+def alert_loop():
+    last, first = None, True
+    while True:
+        try:
+            p = make_plan()
+            s = p.get("signal")
+            key = (s["side"], s["time"]) if s else None
+            if first:
+                last, first = key, False
+            elif key and key != last:
+                last = key
+                if s["ok"] and s["fresh"] and not s["late"] and p["plan"]:
+                    send_ntfy(p)
+        except Exception as e:
+            print("alert note:", e)
+        time.sleep(60)
 
 
 def build_json(tf):
@@ -257,10 +407,13 @@ body{display:flex;flex-direction:column}
 #sigs{padding:2px 12px 8px;display:flex;gap:6px;flex-wrap:wrap}
 .chip{background:#1c212b;border:1px solid #2b3139;border-radius:6px;padding:4px 9px;font-size:12px;cursor:pointer;line-height:1.35}
 .chip.cur{border-color:#ff6d00}
+#plan{margin:2px 12px 8px;padding:8px 10px;background:#161b24;border:1px solid #2b3139;border-radius:8px;font-size:13px;line-height:1.5}
+#plan:empty{display:none}
 .chip b{font-size:13px}
 </style></head><body>
 <div id="top"><span id="name">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="tfs"></span>
 <span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span></div>
+<div id="plan"></div>
 <div id="sigs"></div>
 <div style="padding:0 12px 4px;font-size:12px;opacity:.8"><span id="sum"></span> <span id="upd" style="opacity:.7"></span></div>
 <div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes</div>
@@ -296,6 +449,31 @@ TFS.forEach(x => {
 });
 function mark(){ TFS.forEach(x => document.getElementById('tf_' + x).className = (x === tf ? 'on' : '')); }
 mark();
+
+async function loadPlan(){
+  try{
+    const r = await fetch('/plan?_=' + Date.now());
+    const p = await r.json();
+    const el = document.getElementById('plan');
+    if (p.error){ el.innerHTML = ''; return; }
+    const s = p.signal, pl = p.plan;
+    let h = '<b>1h trade plan</b> (you place orders in Kite) <span style="opacity:.7">| Nifty ' + p.spot.toLocaleString() + ', lot ' + p.lot + '</span><br>';
+    if (!s){ el.innerHTML = h + 'No 1h signal in this data yet.'; return; }
+    const buy = s.side === 'BUY';
+    h += '1h signal: <b style="color:' + (buy ? '#00e676' : '#ff5252') + '">' + s.side + (s.ok ? ' &#10003;' : ' (no EMA)') + '</b> '
+      + s.time + ' (' + s.age_min + ' min ago)';
+    if (!s.ok){ el.innerHTML = h + '<br>No EMA20 confirmation, so NO trade by the bot rule.'; return; }
+    if (!s.fresh) h += '<br><span style="color:#ffb300">Old signal - do not enter now; wait for the next 1h signal.</span>';
+    else if (s.late) h += '<br><span style="color:#ffb300">Signal came at 15:15 or later - better to skip a new entry today.</span>';
+    if (pl){
+      h += '<br>SELL <b>' + pl.sell_strike + ' ' + pl.kind + '</b> (~Rs ' + pl.sell_prem + ') + BUY hedge <b>' + pl.hedge_strike + ' ' + pl.kind + '</b> (~Rs ' + pl.hedge_prem + ')'
+        + '<br>Expiry ' + pl.expiry + ' | credit ~Rs ' + pl.credit.toLocaleString() + ' | max loss ~Rs ' + pl.max_loss.toLocaleString()
+        + '<br>Exit: sell premium reaches Rs ' + pl.sl_prem + ', or 1h Supertrend flips against you.'
+        + '<br><span style="opacity:.65;font-size:11px">Premiums are model estimates (IV ' + pl.iv + '%). Check real prices and margin in Kite before ordering. Not financial advice.</span>';
+    }
+    el.innerHTML = h;
+  } catch(e){}
+}
 
 async function loadSigs(){
   try{
@@ -360,6 +538,7 @@ async function tick(){
 }
 tick(); setInterval(tick, 2000);
 loadSigs(); setInterval(loadSigs, 15000);
+loadPlan(); setInterval(loadPlan, 20000);
 </script></body></html>"""
 
 
@@ -407,6 +586,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
         elif u.path == "/healthz":
             self._send(200, "text/plain", b"ok")
+        elif u.path == "/plan":
+            try:
+                body = json.dumps(make_plan()).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+            self._send(200, "application/json", body)
         elif u.path == "/signals":
             with sig_lock:
                 body = json.dumps(all_signals()).encode("utf-8")
@@ -435,6 +620,9 @@ if __name__ == "__main__":
     if HOST == "0.0.0.0" and not CLOUD:
         print(f"Phone (same WiFi): http://{lan_ip()}:{PORT}")
     print("Stop: Ctrl + C")
+    if NTFY_TOPIC:
+        threading.Thread(target=alert_loop, daemon=True).start()
+        print("Phone alerts ON (ntfy topic set)")
     if not CLOUD:
         threading.Timer(1.0, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
     try:

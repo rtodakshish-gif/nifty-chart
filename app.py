@@ -2,7 +2,7 @@
 LIVE NIFTY 50 chart app  ->  local: http://localhost:8001  |  cloud (Render): your https link   (updates every 2 seconds)
 -----------------------------------------------------------------------------------------------------------
 Data: free Yahoo Finance (^NSEI). It can be slightly delayed. No API key, no broker login, NO orders.
-Time frames: 1m, 5m, 15m, 30m, 1h, 1D (buttons at the top).
+Time frames: 1m, 5m, 15m, 30m, 1h, 1D, 1W (buttons at the top).
 Shows: candles (incl. the running candle), Supertrend(10,3), EMA20, and BUY/SELL signals on EVERY time frame:
   BIG BUY/SELL  = Supertrend flip confirmed by close vs EMA20 (the bot's rule)
   small buy/sell = Supertrend flip without EMA20 confirmation (dim)
@@ -29,7 +29,7 @@ import requests
 SYMBOL = "%5ENSEI"                       # ^NSEI = Nifty 50 on Yahoo Finance
 # time frame -> (yahoo interval, yahoo range, seconds per candle)
 TFS = {"1m": ("1m", "5d", 60), "5m": ("5m", "10d", 300), "15m": ("15m", "30d", 900),
-       "30m": ("30m", "60d", 1800), "1h": ("60m", "6mo", 3600), "1d": ("1d", "2y", 86400)}
+       "30m": ("30m", "60d", 1800), "1h": ("60m", "6mo", 3600), "1d": ("1d", "2y", 86400), "1w": ("1wk", "5y", 604800)}
 ST_PERIOD, ST_MULT, EMA_LEN = 10, 3, 20
 SL_PCT = 0.5                             # stop-loss used in the simulation (% of price)
 PORT = int(os.environ.get("PORT", 8001))   # cloud hosts give the port in $PORT
@@ -134,8 +134,20 @@ def market_status():
     return "OPEN" if open_now else "CLOSED"
 
 
+def closed_count(df, sec, now):
+    """How many candles are finished (the last one may still be running)."""
+    last = int(df.iloc[-1]["time"])
+    if sec >= 604800:                              # weekly candle runs until Friday close
+        running = now < last + 5 * 86400
+    else:
+        running = market_status() == "OPEN" and last + sec > now
+    return len(df) - 1 if running else len(df)
+
+
 def fmt_sig_time(ts, sec):
     """IST time when the signal candle CLOSED."""
+    if sec >= 604800:                              # weekly: show the Friday the week ended
+        return dt.datetime.fromtimestamp(ts + 4 * 86400 + SHIFT, dt.timezone.utc).strftime("%d-%b")
     x = dt.datetime.fromtimestamp(ts + sec + SHIFT, dt.timezone.utc)
     if sec < 86400 and (x.hour, x.minute) > (15, 30):      # last 1h candle is only 15 min long
         x = x.replace(hour=15, minute=30)
@@ -167,7 +179,7 @@ def tf_signal(tf):
         df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
         d, _ = supertrend(df)
         now = int(time.time())
-        n_closed = len(df) - 1 if (market_status() == "OPEN" and df.iloc[-1]["time"] + sec > now) else len(df)
+        n_closed = closed_count(df, sec, now)
         flips = find_flips(df, d, n_closed, sec)
         sig = dict(tf=tf, trend="GREEN" if d[-1] == 1 else "RED",
                    signal=(dict(side="BUY" if flips[-1]["buy"] else "SELL", ok=flips[-1]["ok"],
@@ -251,7 +263,7 @@ def make_plan():
     df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
     d, _ = supertrend(df)
     now = int(time.time())
-    n_closed = len(df) - 1 if (market_status() == "OPEN" and df.iloc[-1]["time"] + sec > now) else len(df)
+    n_closed = closed_count(df, sec, now)
     flips = find_flips(df, d, n_closed, sec)
     spot = float(df.close.iloc[-1])
     out = dict(tf=PLAN_TF, spot=round(spot, 2), trend="GREEN" if d[-1] == 1 else "RED", signal=None, plan=None,
@@ -324,14 +336,14 @@ def alert_loop():
 
 def build_json(tf):
     interval, rng, sec = TFS[tf]
-    intraday = tf != "1d"
+    intraday = sec < 86400
     df = fetch(tf)
     df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
     d, line = supertrend(df)
 
     # a candle is "running" while the market is open and the candle has not finished
     now = int(time.time())
-    n_closed = len(df) - 1 if (market_status() == "OPEN" and df.iloc[-1]["time"] + sec > now) else len(df)
+    n_closed = closed_count(df, sec, now)
     closed = df.iloc[:n_closed].reset_index(drop=True)
     trades = simulate(closed, d[:n_closed], intraday)
 
@@ -421,7 +433,7 @@ body{display:flex;flex-direction:column}
 <div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes</div>
 <div id="chart"></div>
 <script>
-const TFS = ['1m','5m','15m','30m','1h','1d'];
+const TFS = ['1m','5m','15m','30m','1h','1d','1w'];
 let tf = '15m';
 try { tf = localStorage.getItem('ntf') || '15m'; } catch(e){}
 if (!TFS.includes(tf)) tf = '15m';
@@ -442,7 +454,7 @@ let first = true, lastT = 0;
 const box = document.getElementById('tfs');
 TFS.forEach(x => {
   const b = document.createElement('button');
-  b.textContent = x === '1d' ? '1D' : x; b.id = 'tf_' + x;
+  b.textContent = x === '1d' ? '1D' : (x === '1w' ? '1W' : x); b.id = 'tf_' + x;
   b.onclick = () => {
     tf = x; try { localStorage.setItem('ntf', x); } catch(e){}
     first = true; lastT = 0; mark(); tick(); loadSigs();
@@ -502,7 +514,7 @@ async function loadSigs(){
     arr.forEach(s => {
       const el = document.createElement('div');
       el.className = 'chip' + (s.tf === tf ? ' cur' : '');
-      const name = s.tf === '1d' ? '1D' : s.tf;
+      const name = s.tf === '1d' ? '1D' : (s.tf === '1w' ? '1W' : s.tf);
       let h = '<b>' + name + '</b> ';
       if (s.trend) h += '<span style="color:' + (s.trend==='GREEN'?'#00c853':'#ff1744') + '">&#9679;</span> ';
       if (s.signal){
@@ -527,7 +539,7 @@ async function tick(){
     if (want !== tf) return;
     if (j.error){ document.getElementById('upd').textContent = 'error: ' + j.error; return; }
     if (first){
-      chart.applyOptions({timeScale:{timeVisible: want !== '1d'}});
+      chart.applyOptions({timeScale:{timeVisible: (want !== '1d' && want !== '1w')}});
       candles.setData(j.candles); stUp.setData(j.st_up); stDn.setData(j.st_dn); ema.setData(j.ema);
       const n = j.candles.length;
       chart.timeScale().setVisibleLogicalRange({from: Math.max(0, n - 110), to: n + 6});

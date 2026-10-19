@@ -29,7 +29,7 @@ import requests
 SYMBOL = "%5ENSEI"                       # ^NSEI = Nifty 50 on Yahoo Finance
 # time frame -> (yahoo interval, yahoo range, seconds per candle)
 TFS = {"1m": ("1m", "5d", 60), "5m": ("5m", "10d", 300), "15m": ("15m", "30d", 900),
-       "30m": ("30m", "60d", 1800), "1h": ("60m", "6mo", 3600), "1d": ("1d", "2y", 86400), "1w": ("1wk", "5y", 604800)}
+       "30m": ("30m", "60d", 1800), "1h": ("60m", "6mo", 3600), "1d": ("1d", "2y", 86400), "1w": ("1wk", "5y", 604800), "1mo": ("1mo", "10y", 2592000)}
 ST_PERIOD, ST_MULT, EMA_LEN = 10, 3, 20
 SL_PCT = 0.5                             # stop-loss used in the simulation (% of price)
 PORT = int(os.environ.get("PORT", 8001))   # cloud hosts give the port in $PORT
@@ -137,7 +137,11 @@ def market_status():
 def closed_count(df, sec, now):
     """How many candles are finished (the last one may still be running)."""
     last = int(df.iloc[-1]["time"])
-    if sec >= 604800:                              # weekly candle runs until Friday close
+    if sec >= 2592000:                             # monthly candle runs until the month ends
+        d0 = dt.datetime.fromtimestamp(last + SHIFT, dt.timezone.utc)
+        nxt = (d0.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+        running = now < int(nxt.timestamp()) - SHIFT
+    elif sec >= 604800:                            # weekly candle runs until Friday close
         running = now < last + 5 * 86400
     else:
         running = market_status() == "OPEN" and last + sec > now
@@ -146,6 +150,8 @@ def closed_count(df, sec, now):
 
 def fmt_sig_time(ts, sec):
     """IST time when the signal candle CLOSED."""
+    if sec >= 2592000:                             # monthly: show the month
+        return dt.datetime.fromtimestamp(ts + SHIFT, dt.timezone.utc).strftime("%b %Y")
     if sec >= 604800:                              # weekly: show the Friday the week ended
         return dt.datetime.fromtimestamp(ts + 4 * 86400 + SHIFT, dt.timezone.utc).strftime("%d-%b")
     x = dt.datetime.fromtimestamp(ts + sec + SHIFT, dt.timezone.utc)
@@ -433,7 +439,8 @@ body{display:flex;flex-direction:column}
 <div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes</div>
 <div id="chart"></div>
 <script>
-const TFS = ['1m','5m','15m','30m','1h','1d','1w'];
+const TFS = ['1m','5m','15m','30m','1h','1d','1w','1mo'];
+const LBL = {'1d':'1D', '1w':'1W', '1mo':'1M'};
 let tf = '15m';
 try { tf = localStorage.getItem('ntf') || '15m'; } catch(e){}
 if (!TFS.includes(tf)) tf = '15m';
@@ -454,7 +461,7 @@ let first = true, lastT = 0;
 const box = document.getElementById('tfs');
 TFS.forEach(x => {
   const b = document.createElement('button');
-  b.textContent = x === '1d' ? '1D' : (x === '1w' ? '1W' : x); b.id = 'tf_' + x;
+  b.textContent = LBL[x] || x; b.id = 'tf_' + x;
   b.onclick = () => {
     tf = x; try { localStorage.setItem('ntf', x); } catch(e){}
     first = true; lastT = 0; mark(); tick(); loadSigs();
@@ -514,7 +521,7 @@ async function loadSigs(){
     arr.forEach(s => {
       const el = document.createElement('div');
       el.className = 'chip' + (s.tf === tf ? ' cur' : '');
-      const name = s.tf === '1d' ? '1D' : (s.tf === '1w' ? '1W' : s.tf);
+      const name = LBL[s.tf] || s.tf;
       let h = '<b>' + name + '</b> ';
       if (s.trend) h += '<span style="color:' + (s.trend==='GREEN'?'#00c853':'#ff1744') + '">&#9679;</span> ';
       if (s.signal){
@@ -539,7 +546,7 @@ async function tick(){
     if (want !== tf) return;
     if (j.error){ document.getElementById('upd').textContent = 'error: ' + j.error; return; }
     if (first){
-      chart.applyOptions({timeScale:{timeVisible: (want !== '1d' && want !== '1w')}});
+      chart.applyOptions({timeScale:{timeVisible: !LBL[want]}});
       candles.setData(j.candles); stUp.setData(j.st_up); stDn.setData(j.st_dn); ema.setData(j.ema);
       const n = j.candles.length;
       chart.timeScale().setVisibleLogicalRange({from: Math.max(0, n - 110), to: n + 6});

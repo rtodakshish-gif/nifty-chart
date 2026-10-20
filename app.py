@@ -134,6 +134,33 @@ def market_status():
     return "OPEN" if open_now else "CLOSED"
 
 
+def market_structure(df, n_closed, t, N):
+    """Swing highs/lows (pivot with N candles each side) and breakouts of them on CLOSED candles.
+    BOS = close breaks the last swing in the trend direction; CHoCH = break against the prior trend."""
+    high, low, close = df.high.values, df.low.values, df.close.values
+    ph = pl = None
+    trend, events = 0, []
+    for i in range(N, n_closed):
+        j = i - N                                   # pivot at j is confirmed only now (no look-ahead)
+        if j >= N:
+            if high[j] >= high[j - N:j + N + 1].max():
+                ph = (j, float(high[j]))
+            if low[j] <= low[j - N:j + N + 1].min():
+                pl = (j, float(low[j]))
+        c = float(close[i])
+        if ph and c > ph[1]:
+            events.append(dict(kind="CHoCH" if trend == -1 else "BOS", up=True, t0=t[ph[0]], t1=t[i],
+                               price=round(ph[1], 2)))
+            trend, ph = 1, None
+        elif pl and c < pl[1]:
+            events.append(dict(kind="CHoCH" if trend == 1 else "BOS", up=False, t0=t[pl[0]], t1=t[i],
+                               price=round(pl[1], 2)))
+            trend, pl = -1, None
+    return dict(events=events[-14:], trend=trend,
+                high=dict(t=t[ph[0]], price=round(ph[1], 2)) if ph else None,
+                low=dict(t=t[pl[0]], price=round(pl[1], 2)) if pl else None)
+
+
 def closed_count(df, sec, now):
     """How many candles are finished (the last one may still be running)."""
     last = int(df.iloc[-1]["time"])
@@ -386,6 +413,7 @@ def build_json(tf):
     else:
         summary = f"Sim {tf}: no completed trades in this period"
 
+    struct = market_structure(df, n_closed, t, 3 if sec >= 604800 else 5)
     last_sig = (dict(side="BUY" if flips[-1]["buy"] else "SELL", ok=flips[-1]["ok"],
                      price=flips[-1]["price"], time=flips[-1]["time"]) if flips else None)
 
@@ -401,7 +429,7 @@ def build_json(tf):
                   st="GREEN" if d[-1] == 1 else "RED", ema=float(df.ema.iloc[-1]),
                   market=market_status(),
                   time=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)).strftime("%d-%b %H:%M:%S IST")),
-        summary=summary, last_signal=last_sig))
+        summary=summary, last_signal=last_sig, structure=struct))
 
 
 # ---------------- web page ----------------
@@ -432,11 +460,11 @@ body{display:flex;flex-direction:column}
 .chip b{font-size:13px}
 </style></head><body>
 <div id="top"><span id="name">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="tfs"></span>
-<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span><span id="hides"><button class="tg" id="b_plan" onclick="toggleBox('hp')">Hide Plan</button> <button class="tg" id="b_sigs" onclick="toggleBox('hs')">Hide Signals</button></span></div>
+<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span><span id="hides"><button class="tg" id="b_plan" onclick="toggleBox('hp')">Hide Plan</button> <button class="tg" id="b_sigs" onclick="toggleBox('hs')">Hide Signals</button> <button class="tg" id="b_str" onclick="toggleStruct()">Hide Structure</button></span></div>
 <div id="plan"></div>
 <div id="sigs"></div>
 <div style="padding:0 12px 4px;font-size:12px;opacity:.8"><span id="sum"></span> <span id="upd" style="opacity:.7"></span></div>
-<div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes</div>
+<div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes<br>Structure: BOS = close breaks the last swing high/low (trend continues) | CHoCH = break against the earlier trend (possible reversal) | dashed grey lines = latest unbroken swing high/low</div>
 <div id="chart"></div>
 <script>
 const TFS = ['1m','5m','15m','30m','1h','1d','1w','1mo'];
@@ -464,12 +492,47 @@ TFS.forEach(x => {
   b.textContent = LBL[x] || x; b.id = 'tf_' + x;
   b.onclick = () => {
     tf = x; try { localStorage.setItem('ntf', x); } catch(e){}
-    first = true; lastT = 0; mark(); tick(); loadSigs();
+    first = true; lastT = 0; clearStructure(); mark(); tick(); loadSigs();
   };
   box.appendChild(b);
 });
 function mark(){ TFS.forEach(x => document.getElementById('tf_' + x).className = (x === tf ? 'on' : '')); }
 mark();
+
+let structSeries = [], structLines = [], structKey = '', lastStruct = null, showStruct = true;
+try { showStruct = localStorage.getItem('st') !== '0'; } catch(e){}
+function clearStructure(){
+  structSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
+  structLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} });
+  structSeries = []; structLines = []; structKey = '';
+}
+function drawStructure(st){
+  lastStruct = st;
+  document.getElementById('b_str').textContent = (showStruct ? 'Hide' : 'Show') + ' Structure';
+  const key = showStruct ? (tf + JSON.stringify(st)) : 'off';
+  if (key === structKey) return;
+  clearStructure(); structKey = key;
+  if (!showStruct || !st) return;
+  st.events.forEach(e => {
+    const col = e.kind === 'CHoCH' ? '#ce93d8' : '#ffd54f';
+    const s = chart.addLineSeries({color: col, lineWidth: 1, lineStyle: 2, priceLineVisible: false,
+      lastValueVisible: false, crosshairMarkerVisible: false});
+    s.setData([{time: e.t0, value: e.price}, {time: e.t1, value: e.price}]);
+    s.setMarkers([{time: e.t1, position: e.up ? 'belowBar' : 'aboveBar', color: col, shape: 'circle',
+      text: e.kind + (e.up ? ' up' : ' down')}]);
+    structSeries.push(s);
+  });
+  [[st.high, 'Swing H'], [st.low, 'Swing L']].forEach(a => {
+    if (a[0]) structLines.push(candles.createPriceLine({price: a[0].price, color: '#78909c', lineWidth: 1,
+      lineStyle: 2, axisLabelVisible: true, title: a[1]}));
+  });
+}
+function toggleStruct(){
+  showStruct = !showStruct;
+  try { localStorage.setItem('st', showStruct ? '1' : '0'); } catch(e){}
+  structKey = '';
+  drawStructure(lastStruct);
+}
 
 const hideState = {hp: '0', hs: '0'};
 try { hideState.hp = localStorage.getItem('hp') || '0'; hideState.hs = localStorage.getItem('hs') || '0'; } catch(e){}
@@ -557,6 +620,7 @@ async function tick(){
     }
     lastT = j.candles[j.candles.length - 1].time;
     candles.setMarkers(j.markers);
+    drawStructure(j.structure);
     const up = j.last.chg >= 0;
     document.getElementById('price').textContent = j.last.price.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2});
     const c = document.getElementById('chg');

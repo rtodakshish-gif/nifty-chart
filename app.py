@@ -161,6 +161,41 @@ def market_structure(df, n_closed, t, N):
                 low=dict(t=t[pl[0]], price=round(pl[1], 2)) if pl else None)
 
 
+def liquidity_zones(df, n_closed, t, N, atr):
+    """Liquidity = swing highs/lows where stop-losses sit. EQH/EQL = two swings at (almost) the same level.
+    Sweep = a candle pokes beyond a swing level but CLOSES back inside (stop-hunt). Closed candles only."""
+    high, low, close = df.high.values, df.low.values, df.close.values
+    levels, sweeps = [], []
+    for i in range(N, n_closed):
+        j = i - N
+        if j >= N:
+            tol = 0.25 * float(atr[i])
+            for side, arr, ok in (("H", high, high[j] >= high[j - N:j + N + 1].max()),
+                                  ("L", low, low[j] <= low[j - N:j + N + 1].min())):
+                if not ok:
+                    continue
+                lv = dict(side=side, j=j, price=float(arr[j]), eq=False, done=False)
+                for o in levels:                    # equal high / equal low with an earlier untouched swing
+                    if o["side"] == side and not o["done"] and abs(o["price"] - lv["price"]) <= tol:
+                        o["eq"] = lv["eq"] = True
+                levels.append(lv)
+            levels = levels[-80:]
+        for lv in levels:
+            if lv["done"]:
+                continue
+            if lv["side"] == "H" and high[i] > lv["price"]:
+                lv["done"] = True
+                if close[i] < lv["price"]:
+                    sweeps.append(dict(up=False, eq=lv["eq"], t0=t[lv["j"]], t1=t[i], price=round(lv["price"], 2)))
+            elif lv["side"] == "L" and low[i] < lv["price"]:
+                lv["done"] = True
+                if close[i] > lv["price"]:
+                    sweeps.append(dict(up=True, eq=lv["eq"], t0=t[lv["j"]], t1=t[i], price=round(lv["price"], 2)))
+    pools = [dict(side=lv["side"], t0=t[lv["j"]], price=round(lv["price"], 2))
+             for lv in levels if lv["eq"] and not lv["done"]]
+    return dict(sweeps=sweeps[-12:], pools=pools[-6:], end=t[n_closed - 1])
+
+
 def closed_count(df, sec, now):
     """How many candles are finished (the last one may still be running)."""
     last = int(df.iloc[-1]["time"])
@@ -414,6 +449,9 @@ def build_json(tf):
         summary = f"Sim {tf}: no completed trades in this period"
 
     struct = market_structure(df, n_closed, t, 3 if sec >= 604800 else 5)
+    tr = pd.concat([df.high - df.low, (df.high - df.close.shift()).abs(),
+                    (df.low - df.close.shift()).abs()], axis=1).max(axis=1)
+    liq = liquidity_zones(df, n_closed, t, 3 if sec >= 604800 else 5, tr.rolling(14, min_periods=1).mean().values)
     last_sig = (dict(side="BUY" if flips[-1]["buy"] else "SELL", ok=flips[-1]["ok"],
                      price=flips[-1]["price"], time=flips[-1]["time"]) if flips else None)
 
@@ -429,7 +467,7 @@ def build_json(tf):
                   st="GREEN" if d[-1] == 1 else "RED", ema=float(df.ema.iloc[-1]),
                   market=market_status(),
                   time=(dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)).strftime("%d-%b %H:%M:%S IST")),
-        summary=summary, last_signal=last_sig, structure=struct))
+        summary=summary, last_signal=last_sig, structure=struct, liquidity=liq))
 
 
 # ---------------- web page ----------------
@@ -460,11 +498,11 @@ body{display:flex;flex-direction:column}
 .chip b{font-size:13px}
 </style></head><body>
 <div id="top"><span id="name">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="tfs"></span>
-<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span><span id="hides"><button class="tg" id="b_plan" onclick="toggleBox('hp')">Hide Plan</button> <button class="tg" id="b_sigs" onclick="toggleBox('hs')">Hide Signals</button> <button class="tg" id="b_str" onclick="toggleStruct()">Hide Structure</button></span></div>
+<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span><span id="hides"><button class="tg" id="b_plan" onclick="toggleBox('hp')">Hide Plan</button> <button class="tg" id="b_sigs" onclick="toggleBox('hs')">Hide Signals</button> <button class="tg" id="b_str" onclick="toggleStruct()">Hide Structure</button> <button class="tg" id="b_liq" onclick="toggleLiq()">Hide Liquidity</button></span></div>
 <div id="plan"></div>
 <div id="sigs"></div>
 <div style="padding:0 12px 4px;font-size:12px;opacity:.8"><span id="sum"></span> <span id="upd" style="opacity:.7"></span></div>
-<div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes<br>Structure: BOS = close breaks the last swing high/low (trend continues) | CHoCH = break against the earlier trend (possible reversal) | dashed grey lines = latest unbroken swing high/low</div>
+<div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes<br>Structure: BOS = close breaks the last swing high/low (trend continues) | CHoCH = break against the earlier trend (possible reversal) | dashed grey lines = latest unbroken swing high/low<br>Liquidity: EQH/EQL (orange) = equal highs/lows where stop-losses pile up | Sweep (cyan) = price poked beyond a swing level but closed back inside (stop-hunt), often a reversal hint</div>
 <div id="chart"></div>
 <script>
 const TFS = ['1m','5m','15m','30m','1h','1d','1w','1mo'];
@@ -492,7 +530,7 @@ TFS.forEach(x => {
   b.textContent = LBL[x] || x; b.id = 'tf_' + x;
   b.onclick = () => {
     tf = x; try { localStorage.setItem('ntf', x); } catch(e){}
-    first = true; lastT = 0; clearStructure(); mark(); tick(); loadSigs();
+    first = true; lastT = 0; clearStructure(); clearLiquidity(); mark(); tick(); loadSigs();
   };
   box.appendChild(b);
 });
@@ -532,6 +570,37 @@ function toggleStruct(){
   try { localStorage.setItem('st', showStruct ? '1' : '0'); } catch(e){}
   structKey = '';
   drawStructure(lastStruct);
+}
+
+let liqSeries = [], liqKey = '', lastLiq = null, showLiq = true;
+try { showLiq = localStorage.getItem('lq') !== '0'; } catch(e){}
+function clearLiquidity(){
+  liqSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
+  liqSeries = []; liqKey = '';
+}
+function drawLiquidity(lq){
+  lastLiq = lq;
+  document.getElementById('b_liq').textContent = (showLiq ? 'Hide' : 'Show') + ' Liquidity';
+  const key = showLiq ? (tf + JSON.stringify(lq)) : 'off';
+  if (key === liqKey) return;
+  clearLiquidity(); liqKey = key;
+  if (!showLiq || !lq) return;
+  const mk = (t0, t1, price, col, text, pos) => {
+    if (!(t1 > t0)) return;
+    const s = chart.addLineSeries({color: col, lineWidth: 1, lineStyle: 1, priceLineVisible: false,
+      lastValueVisible: false, crosshairMarkerVisible: false});
+    s.setData([{time: t0, value: price}, {time: t1, value: price}]);
+    s.setMarkers([{time: (pos === 'start' ? t0 : t1), position: 'inBar', color: col, shape: 'square', text: text}]);
+    liqSeries.push(s);
+  };
+  lq.pools.forEach(p => mk(p.t0, lq.end, p.price, '#ffa726', p.side === 'H' ? 'EQH' : 'EQL', 'start'));
+  lq.sweeps.forEach(e => mk(e.t0, e.t1, e.price, '#26c6da', (e.eq ? 'EQ ' : '') + 'Sweep ' + (e.up ? 'low' : 'high'), 'end'));
+}
+function toggleLiq(){
+  showLiq = !showLiq;
+  try { localStorage.setItem('lq', showLiq ? '1' : '0'); } catch(e){}
+  liqKey = '';
+  drawLiquidity(lastLiq);
 }
 
 const hideState = {hp: '0', hs: '0'};
@@ -621,6 +690,7 @@ async function tick(){
     lastT = j.candles[j.candles.length - 1].time;
     candles.setMarkers(j.markers);
     drawStructure(j.structure);
+    drawLiquidity(j.liquidity);
     const up = j.last.chg >= 0;
     document.getElementById('price').textContent = j.last.price.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2});
     const c = document.getElementById('chg');

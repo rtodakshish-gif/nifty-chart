@@ -498,11 +498,13 @@ body{display:flex;flex-direction:column}
 .chip b{font-size:13px}
 </style></head><body>
 <div id="top"><span id="name">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="tfs"></span>
-<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span><span id="hides"><button class="tg" id="b_plan" onclick="toggleBox('hp')">Hide Plan</button> <button class="tg" id="b_sigs" onclick="toggleBox('hs')">Hide Signals</button> <button class="tg" id="b_str" onclick="toggleStruct()">Hide Structure</button> <button class="tg" id="b_liq" onclick="toggleLiq()">Hide Liquidity</button></span></div>
+<span id="st"></span><span id="ema"></span><span id="mkt"></span><span id="lastsig"></span><span id="hides"><button class="tg" id="b_plan" onclick="toggleBox('hp')">Hide Plan</button> <button class="tg" id="b_sigs" onclick="toggleBox('hs')">Hide Signals</button> <button class="tg" id="b_str" onclick="toggleStruct()">Hide Structure</button> <button class="tg" id="b_liq" onclick="toggleLiq()">Hide Liquidity</button> <button class="tg" id="b_info" onclick="toggleBox('hi')">Hide Info</button></span></div>
 <div id="plan"></div>
 <div id="sigs"></div>
+<div id="info">
 <div style="padding:0 12px 4px;font-size:12px;opacity:.8"><span id="sum"></span> <span id="upd" style="opacity:.7"></span></div>
 <div style="padding:0 12px 6px;font-size:11px;opacity:.65">BUY / SELL (big) = Supertrend flip + EMA20 confirmed (bot rule) &nbsp;|&nbsp; buy / sell (dim) = flip without EMA20 confirmation &nbsp;|&nbsp; signals are given only after the candle closes<br>Structure: BOS = close breaks the last swing high/low (trend continues) | CHoCH = break against the earlier trend (possible reversal) | dashed grey lines = latest unbroken swing high/low<br>Liquidity: EQH/EQL (orange) = equal highs/lows where stop-losses pile up | Sweep (cyan) = price poked beyond a swing level but closed back inside (stop-hunt), often a reversal hint</div>
+</div>
 <div id="chart"></div>
 <script>
 const TFS = ['1m','5m','15m','30m','1h','1d','1w','1mo'];
@@ -603,10 +605,10 @@ function toggleLiq(){
   drawLiquidity(lastLiq);
 }
 
-const hideState = {hp: '0', hs: '0'};
-try { hideState.hp = localStorage.getItem('hp') || '0'; hideState.hs = localStorage.getItem('hs') || '0'; } catch(e){}
+const hideState = {hp: '0', hs: '0', hi: '0'};
+try { hideState.hp = localStorage.getItem('hp') || '0'; hideState.hs = localStorage.getItem('hs') || '0'; hideState.hi = localStorage.getItem('hi') || '0'; } catch(e){}
 function applyHide(){
-  [['hp','plan','Plan'], ['hs','sigs','Signals']].forEach(a => {
+  [['hp','plan','Plan'], ['hs','sigs','Signals'], ['hi','info','Info']].forEach(a => {
     const off = hideState[a[0]] === '1';
     document.getElementById(a[1]).classList.toggle('hid', off);
     document.getElementById('b_' + a[1]).textContent = (off ? 'Show ' : 'Hide ') + a[2];

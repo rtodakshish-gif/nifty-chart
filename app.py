@@ -450,6 +450,31 @@ def sr_pick(lv, price, src):
 sr_cache = {}
 
 
+zone_cache = {}
+
+
+def zones_1h(tf, sym, df):
+    """Demand / supply zones are ALWAYS taken from the 1-hour chart, whatever time frame is shown."""
+    c = zone_cache.get(sym)
+    if c is None or time.time() - c["t"] > 30:
+        dfh = df if tf == SR_TF else fetch(SR_TF, sym)
+        nch = closed_count(dfh, 3600, int(time.time()))
+        trh = pd.concat([dfh.high - dfh.low, (dfh.high - dfh.close.shift()).abs(),
+                         (dfh.low - dfh.close.shift()).abs()], axis=1).max(axis=1)
+        c = zone_cache[sym] = {"zn": sr_zones(dfh, nch, trh.rolling(14, min_periods=1).mean().values), "t": time.time()}
+    return c["zn"]
+
+
+def snap_zones(zones, t):
+    """Put each zone's start on a candle of the chart that is shown (a 1h zone on a daily chart starts at that day's candle)."""
+    import bisect
+    out = []
+    for z in zones:
+        k = bisect.bisect_right(t, z["t0"]) - 1
+        out.append(dict(z, t0=t[max(k, 0)]))
+    return out
+
+
 def sr_levels_for(tf, sym, df, n_closed, sec, atr14):
     """Charts of 1h and smaller (1m ... 30m) use the 1-HOUR support/resistance (SR_TF); bigger ones use their own."""
     N = 3 if sec >= 604800 else 5
@@ -461,9 +486,9 @@ def sr_levels_for(tf, sym, df, n_closed, sec, atr14):
             trh = pd.concat([dfh.high - dfh.low, (dfh.high - dfh.close.shift()).abs(),
                              (dfh.low - dfh.close.shift()).abs()], axis=1).max(axis=1)
             ah = trh.rolling(14, min_periods=1).mean().values
-            c = sr_cache[sym] = {"lv": sr_levels(dfh, nch, N, ah), "zn": sr_zones(dfh, nch, ah), "t": time.time()}
-        return c["lv"], c["zn"], SR_TF
-    return sr_levels(df, n_closed, N, atr14), sr_zones(df, n_closed, atr14), tf
+            c = sr_cache[sym] = {"lv": sr_levels(dfh, nch, N, ah), "t": time.time()}
+        return c["lv"], SR_TF
+    return sr_levels(df, n_closed, N, atr14), tf
 
 
 def closed_count(df, sec, now):
@@ -1046,9 +1071,9 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     atr14 = tr.rolling(14, min_periods=1).mean().values
     liq = liquidity_zones(df, n_closed, t, 3 if sec >= 604800 else 5, atr14)
     smc = smc_zones(df, n_closed, t, 3 if sec >= 604800 else 5, atr14, struct.pop("_all"))
-    sr_lv, sr_zn, sr_src = sr_levels_for(tf, sym, df, n_closed, sec, atr14)
+    sr_lv, sr_src = sr_levels_for(tf, sym, df, n_closed, sec, atr14)
     sr = sr_pick(sr_lv, float(df.close.iloc[-1]), sr_src)
-    sr["zones"] = [dict(z, t0=max(z["t0"], t[0])) for z in sr_zn]       # never start before the first candle of this chart
+    sr["zones"] = snap_zones(zones_1h(tf, sym, df), t)                   # always 1h zones, started on a candle of this chart
     sr["end"] = t[-1]
     last_sig = (dict(side="BUY" if flips[-1]["buy"] else "SELL", ok=flips[-1]["ok"],
                      price=flips[-1]["price"], time=flips[-1]["time"]) if flips else None)
@@ -1143,7 +1168,7 @@ h3{margin:0 0 10px;font-size:15px;color:var(--st)}
   <section class="view" id="v_chart">
     <div id="ch"><span id="nm">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="mkt"></span></div>
     <div class="scrollx" id="tfs"></div>
-    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_smc" onclick="toggleSMC()">SMC</button><button class="btn" id="b_liq" onclick="toggleLiq()">Liquidity</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button></div>
+    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_smc" onclick="toggleSMC()">SMC</button><button class="btn" id="b_liq" onclick="toggleLiq()">Liquidity</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button></div>
     <div id="stat"><span id="st"></span><span id="ema"></span><span id="lastsig"></span></div>
     <div id="chart"></div>
     <div id="foot"><span id="sum"></span> <span id="upd"></span></div>
@@ -1153,10 +1178,10 @@ h3{margin:0 0 10px;font-size:15px;color:var(--st)}
     <div id="sigs"></div>
     <div class="how">
       <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes.</p>
-      <p><b>Structure (part of SMC):</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
-      <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Same time-frame rule as below (15m/30m/1h charts use 1h zones).</p>
+      <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
+      <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M).</p>
       <p><b>Support / Resistance:</b> on 1m, 5m, 15m, 30m and 1h charts these are taken from the <b>1-hour</b> chart (so 15m entries use 1h levels; label shows 1h). Green lines (S1, S2, S3) = support below the price, red lines (R1, R2, R3) = resistance above it. S1/R1 is the nearest. (3x) = how many swing highs/lows formed there, more = stronger. When price crosses a level it flips from support to resistance or the other way.</p>
-      <p><b>SMC (smart money):</b> <b>Bull OB / Bear OB</b> = order block: the last down (up) candle before the move that broke structure; price often reacts when it returns (dim = already tested once, gone when a candle closes through it). <b>FVG</b> = fair value gap, a 3-candle gap price has not filled yet (box shrinks as price fills it). <b>EQ 50%</b> = middle of the latest swing range: above it is <span class="dn">premium</span> (look for sells), below it <span class="up">discount</span> (look for buys). BOS/CHoCH (structure) is part of the SMC button too. Liquidity lines and sweeps have their own Liquidity button. Tap SMC to hide order blocks, FVG, EQ and BOS/CHoCH.</p>
+      <p><b>SMC (smart money):</b> <b>Bull OB / Bear OB</b> = order block: the last down (up) candle before the move that broke structure; price often reacts when it returns (dim = already tested once, gone when a candle closes through it). <b>FVG</b> = fair value gap, a 3-candle gap price has not filled yet (box shrinks as price fills it). <b>EQ 50%</b> = middle of the latest swing range: above it is <span class="dn">premium</span> (look for sells), below it <span class="up">discount</span> (look for buys). BOS/CHoCH (structure) has its own Structure button and the liquidity lines and sweeps have their own Liquidity button. Tap SMC to hide order blocks, FVG and EQ.</p>
       <p><b>Liquidity (live):</b> BSL = stop-losses above a swing high, SSL = below a swing low, EQH/EQL (orange) = equal highs/lows (strongest). Labels are on the price axis. Sweep (cyan) = price poked beyond a level but closed back inside (stop-hunt); yellow LIVE Sweep = happening on the running candle right now.</p>
       <p>Data: free Yahoo Finance, can be delayed. This app shows charts only, it never places orders.</p>
     </div>
@@ -1269,7 +1294,7 @@ function mark(){ TFS.forEach(x => $('tf_' + x).className = 'btn' + (x === tf ? '
 mark();
 
 /* ---------- market structure ---------- */
-let structSeries = [], structLines = [], structKey = '', lastStruct = null;                  // shown / hidden together with SMC (one button)
+let structSeries = [], structLines = [], structKey = '', lastStruct = null, showStruct = ls('st', '1') !== '0';
 function clearStructure(){
   structSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
   structLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} });
@@ -1277,10 +1302,11 @@ function clearStructure(){
 }
 function drawStructure(st){
   lastStruct = st;
-  const key = showSMC ? (sym + tf + JSON.stringify(st)) : 'off';
+  $('b_str').className = 'btn' + (showStruct ? ' on' : '');
+  const key = showStruct ? (sym + tf + JSON.stringify(st)) : 'off';
   if (key === structKey) return;
   clearStructure(); structKey = key;
-  if (!showSMC || !st) return;
+  if (!showStruct || !st) return;
   st.events.forEach(e => {
     const col = e.kind === 'CHoCH' ? '#ab47bc' : '#f9a825';
     const s = chart.addLineSeries({color: col, lineWidth: 1, lineStyle: 2, priceLineVisible: false,
@@ -1341,7 +1367,7 @@ function drawSR(sr){
   clearSR(); srKey = key;
   if (!showSR || !sr) return;
   (sr.zones || []).forEach(z => zone(z.t0, sr.end, z.lo, z.hi, z.up ? '46,158,79' : '223,81,76', z.tested ? 0.12 : 0.24,
-    (z.up ? 'Demand ' : 'Supply ') + (sr.src || '') + (z.tested ? ' (tested)' : ''), undefined, srSeries));
+    (z.up ? 'Demand ' : 'Supply ') + '1h' + (z.tested ? ' (tested)' : ''), undefined, srSeries));
   sr.levels.forEach(l => {
     const col = l.kind === 'S' ? '#2e9e4f' : '#df514c';
     srLines.push(candles.createPriceLine({price: l.price, color: col, lineWidth: l.touches >= 4 ? 2 : 1, lineStyle: 0,
@@ -1386,7 +1412,8 @@ function drawSMC(sm){
     (o.up ? 'Bull OB' : 'Bear OB') + (o.tested ? ' (tested)' : '')));
   sm.fvgs.forEach(f => zone(f.t0, sm.end, f.lo, f.hi, f.up ? '66,165,245' : '255,167,38', 0.22, f.up ? 'FVG up' : 'FVG down'));
 }
-function toggleSMC(){ showSMC = !showSMC; ss('sm', showSMC ? '1' : '0'); smcKey = ''; structKey = ''; drawSMC(lastSMC); drawStructure(lastStruct); }
+function toggleSMC(){ showSMC = !showSMC; ss('sm', showSMC ? '1' : '0'); smcKey = ''; drawSMC(lastSMC); }
+function toggleStruct(){ showStruct = !showStruct; ss('st', showStruct ? '1' : '0'); structKey = ''; drawStructure(lastStruct); }
 function toggleLiq(){ showLiq = !showLiq; ss('lq', showLiq ? '1' : '0'); liqKey = ''; drawLiquidity(lastLiq); }
 
 

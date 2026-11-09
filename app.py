@@ -387,6 +387,64 @@ def align_period(df, interval):
     return out
 
 
+# Days with a SPECIAL session that Yahoo leaves out completely (Sunday 8-Nov-2026 = Diwali Muhurat trading, 14:15-15:25).
+# Kite shows those candles, Yahoo does not, so EMA20 / Supertrend drifted away from Kite. The 5-minute candles below were read
+# off Kite's chart (accurate to ~1-2 points; the rebuilt 15m candles match Kite's own 15m candles within 1.3 points and
+# EMA20 comes out 24,889.10 vs Kite 24,889.12). They are only used when Yahoo has NO rows at all for that day, so
+# the moment Yahoo starts sending the day itself, this list is ignored. Add a new entry for a future special session if needed.
+SPECIAL_SESSIONS = [
+    dict(date="2026-11-08", start="14:15", candles5=[   # (open, high, low, close), one per 5 minutes
+        (25070.4, 25131.0, 25039.1, 25104.4),
+        (25107.5, 25111.6, 24986.4, 24986.4),
+        (24987.4, 25072.8, 24985.7, 25062.6),
+        (25062.6, 25074.8, 25041.8, 25058.5),
+        (25055.1, 25079.3, 25051.7, 25075.9),
+        (25075.9, 25082.3, 25063.3, 25068.4),
+        (25068.4, 25080.3, 25068.0, 25079.6),
+        (25079.6, 25081.0, 25074.1, 25075.5),
+        (25075.9, 25084.0, 25058.8, 25065.6),
+        (25066.3, 25068.7, 25052.7, 25056.8),
+        (25056.5, 25056.5, 24991.8, 25022.8),
+        (25022.8, 25022.8, 25022.8, 25022.8),
+        (25022.8, 25022.8, 25022.8, 25022.8),
+        (25023.5, 25023.5, 24986.4, 24986.4),
+    ]),
+]
+
+
+def add_special(df, sec):
+    """Insert the candles of SPECIAL_SESSIONS into an intraday frame (5m / 15m / 30m / 1h) when Yahoo lacks that day."""
+    if sec < 300 or sec >= 86400 or df.empty:
+        return df
+    t = df["time"].astype("int64").values
+    extra = []
+    for sp in SPECIAL_SESSIONS:
+        y, mo, d = (int(x) for x in sp["date"].split("-"))
+        day0 = int(dt.datetime(y, mo, d, tzinfo=dt.timezone.utc).timestamp()) - SHIFT       # IST midnight of that day
+        if not (t[0] < day0 and t[-1] >= day0 + 86400):
+            continue                                       # the loaded history does not cover that day (e.g. last-session-only request)
+        if ((t >= day0) & (t < day0 + 86400)).any():
+            continue                                       # Yahoo has the day itself: use Yahoo
+        hh, mm = (int(x) for x in sp["start"].split(":"))
+        grid0 = day0 + 9 * 3600 + 15 * 60
+        buckets = {}
+        for i, (o, h, l, c) in enumerate(sp["candles5"]):
+            ts5 = day0 + hh * 3600 + mm * 60 + i * 300
+            b = grid0 + (ts5 - grid0) // sec * sec
+            if b in buckets:
+                q = buckets[b]; q[1] = max(q[1], h); q[2] = min(q[2], l); q[3] = c
+            else:
+                buckets[b] = [o, h, l, c]
+        extra += [(b, *v) for b, v in buckets.items()]
+    if not extra:
+        return df
+    add = pd.DataFrame(extra, columns=["time", "open", "high", "low", "close"])
+    out = pd.concat([df[["time", "open", "high", "low", "close"]], add]).sort_values("time").reset_index(drop=True)
+    out["time"] = out["time"].astype(int)
+    out.attrs = dict(df.attrs)
+    return out
+
+
 yahoo_cool = [0.0]                       # Yahoo answered "429 too many requests" -> everybody slows down until this time
 
 
@@ -416,7 +474,7 @@ def fetch(tf, sym=DEFAULT_SYM, recent=False):
             df["time"] = df["time"].astype(int)
             df = df.drop_duplicates("time", keep="last").sort_values("time").reset_index(drop=True)
             if interval not in ("1d", "1wk", "1mo"):
-                df = align_intraday(df, TFS[tf][2])
+                df = add_special(align_intraday(df, TFS[tf][2]), TFS[tf][2])
             else:
                 df = align_period(df, interval)
             if len(df) < (1 if recent else 30):

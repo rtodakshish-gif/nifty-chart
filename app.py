@@ -343,6 +343,9 @@ if (fpb && window.PublicKeyCredential){
 def align_intraday(df, sec):
     """Yahoo adds a half-finished 'latest price' row whose time is the last trade time (e.g. 10:44:12), not a candle
     start. Such rows used to show up as tiny dashes next to the real candle. Merge every row into its own candle."""
+    df = df[(df["time"].astype("int64") + SHIFT) % 86400 >= 9 * 3600 + 15 * 60].reset_index(drop=True)   # pre-open (before 09:15) is not a candle
+    if df.empty:
+        return df
     t = df["time"].astype("int64").values
     day0 = (t + SHIFT) // 86400 * 86400 - SHIFT
     start = day0 + 9 * 3600 + 15 * 60                        # NSE session starts 09:15, candles are 09:15 + n x sec
@@ -401,7 +404,7 @@ def fetch(tf, sym=DEFAULT_SYM, recent=False):
     for host in ("query1", "query2"):
         try:
             url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{urlquote(sym, safe='')}"
-            prm = {"interval": interval, "range": rng, "includePrePost": "false"}
+            prm = {"interval": interval, "range": rng, "includePrePost": "true" if interval not in ("1d", "1wk", "1mo") else "false"}
             if recent:
                 prm["_"] = str(int(time.time() * 1000))      # unique URL every time: Yahoo's edge cache cannot hand back an old copy
             r = http.get(url, params=prm, headers=HEADERS, timeout=8)
@@ -3667,6 +3670,24 @@ class Handler(BaseHTTPRequestHandler):
             if time.time() - jmeta["updated"] > 120 and not jupd_lock.locked():
                 journal_refresh()
             self._send(200, "application/json", json.dumps(journal_view(tfq, days, q.get("src", ["ST"])[0])).encode("utf-8"))
+        elif u.path == "/rawdata":
+            q = parse_qs(u.query)
+            tfq = q.get("tf", ["15m"])[0]
+            tfq = tfq if tfq in TFS and tfq not in ("4h",) else "15m"
+            out = [f"Raw Yahoo rows for {DEFAULT_SYM} {tfq} (IST). Look for the evening rows of 8-Nov (Muhurat)."]
+            for pp in ("false", "true"):
+                try:
+                    r = http.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urlquote(DEFAULT_SYM, safe='')}",
+                                 params={"interval": TFS[tfq][0], "range": "5d", "includePrePost": pp}, headers=HEADERS, timeout=8)
+                    res = r.json()["chart"]["result"][0]
+                    qq = res["indicators"]["quote"][0]
+                    rows = [(t, o, h, l, c) for t, o, h, l, c in zip(res["timestamp"], qq["open"], qq["high"], qq["low"], qq["close"])]
+                    out.append(f"\n=== includePrePost={pp}: {len(rows)} rows, last 70 ===")
+                    for t, o, h, l, c in rows[-70:]:
+                        out.append(dt.datetime.fromtimestamp(t + SHIFT, dt.timezone.utc).strftime("%d-%b %H:%M:%S") + f"  O {o}  H {h}  L {l}  C {c}")
+                except Exception as e:
+                    out.append(f"\n=== includePrePost={pp}: error {e}")
+            self._send(200, "text/plain; charset=utf-8", "\n".join(out).encode("utf-8"))
         elif u.path == "/drawdown":
             q = parse_qs(u.query)
             try:

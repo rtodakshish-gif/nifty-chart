@@ -753,7 +753,7 @@ def liquidity_zones(df, n_closed, t, N, atr):
     return dict(sweeps=sweeps[-12:], levels=chosen[:8], end=t[n - 1])
 
 
-def sr_levels(df, n_closed, N, atr):
+def sr_levels(df, n_closed, N, atr, n_live=None):
     """All support/resistance zones = price areas where swing highs AND swing lows repeatedly formed (>= 2 touches)."""
     high, low, close = df.high.values, df.low.values, df.close.values
     pv = []
@@ -772,7 +772,37 @@ def sr_levels(df, n_closed, N, atr):
         cur.append(p)
     if cur:
         clusters.append(cur)
-    return [dict(price=round(sum(c) / len(c), 2), touches=len(c)) for c in clusters if len(c) >= 2]
+    out = [dict(price=round(sum(c) / len(c), 2), touches=len(c)) for c in clusters if len(c) >= 2]
+    if n_live:                                       # FRESH levels (1 touch): a new swing shows at once, also while the candle is running
+        out += sr_fresh(df, n_live, atr, out, tol)
+    return out
+
+
+def sr_fresh(df, n, atr, have, tol, K=2, back=60):
+    """A recent swing low / high (K candles each side, running candle included) that already moved away from its price
+    by >= 1 x ATR is shown as a 1-touch level, without waiting 5 more candles like the confirmed (>= 2 touches) levels.
+    When price comes back and bounces again, it joins a confirmed cluster (2x, 3x ...) automatically."""
+    high, low = df.high.values, df.low.values
+    a = float(atr[n - 1])
+    found = []
+    for j in range(max(K, n - back), n - 1):
+        hi_k = min(n, j + K + 1)
+        if low[j] <= low[max(0, j - K):hi_k].min() and float(high[j + 1:n].max()) - low[j] >= a:
+            found.append(float(low[j]))
+        if high[j] >= high[max(0, j - K):hi_k].max() and high[j] - float(low[j + 1:n].min()) >= a:
+            found.append(float(high[j]))
+    found.sort()
+    out, cur = [], []
+    for p in found + [None]:
+        if p is not None and (not cur or p - cur[0] <= tol):
+            cur.append(p)
+            continue
+        if cur:
+            px = sum(cur) / len(cur)
+            if all(abs(px - x["price"]) > tol for x in have):
+                out.append(dict(price=round(px, 2), touches=max(1, min(len(cur), 1))))
+        cur = [p] if p is not None else []
+    return out
 
 
 def sr_zones(df, n_closed, atr):
@@ -860,13 +890,13 @@ def sr_levels_for(tf, sym, df, n_closed, sec, atr14):
     N = 3 if sec >= 604800 else 5
     if sec <= 3600:
         c = sr_cache.get(sym)
-        if c is None or time.time() - c["t"] > 30:
+        if c is None or time.time() - c["t"] > 10:
             dfh = df if tf == SR_TF else fetch(SR_TF, sym)
             nch = closed_count(dfh, 3600, int(time.time()))
             trh = pd.concat([dfh.high - dfh.low, (dfh.high - dfh.close.shift()).abs(),
                              (dfh.low - dfh.close.shift()).abs()], axis=1).max(axis=1)
             ah = trh.rolling(14, min_periods=1).mean().values
-            c = sr_cache[sym] = {"lv": sr_levels(dfh, nch, N, ah), "t": time.time()}
+            c = sr_cache[sym] = {"lv": sr_levels(dfh, nch, N, ah, n_live=len(dfh)), "t": time.time()}
         return c["lv"], SR_TF
     return sr_levels(df, n_closed, N, atr14), tf
 
@@ -2217,7 +2247,7 @@ function drawSR(sr){
     (z.up ? 'Demand ' : 'Supply ') + '1h' + (z.tested ? ' (tested)' : ''), undefined, srSeries));
   sr.levels.forEach(l => {
     const col = l.kind === 'S' ? '#2e9e4f' : '#df514c';
-    srLines.push(candles.createPriceLine({price: l.price, color: col, lineWidth: l.touches >= 4 ? 2 : 1, lineStyle: 0,
+    srLines.push(candles.createPriceLine({price: l.price, color: col, lineWidth: l.touches >= 4 ? 2 : 1, lineStyle: l.touches < 2 ? 2 : 0,
       axisLabelVisible: true, title: l.kind + l.n + (sr.src ? ' ' + sr.src : '') + ' (' + l.touches + 'x)', axisLabelColor: col, axisLabelTextColor: '#ffffff'}));
   });
 }

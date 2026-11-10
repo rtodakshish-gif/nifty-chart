@@ -602,7 +602,8 @@ def simulate_ema(df, d, intraday):
 
 def market_status():
     ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)
-    open_now = ist.weekday() < 5 and dt.time(9, 15) <= ist.time() <= dt.time(15, 30)
+    open_now = (ist.weekday() < 5 and ist.date().isoformat() not in NSE_HOLIDAYS      # NSE holiday (e.g. Diwali Balipratipada 10-Nov) = closed
+                and dt.time(9, 15) <= ist.time() <= dt.time(15, 30))
     return "OPEN" if open_now else "CLOSED"
 
 

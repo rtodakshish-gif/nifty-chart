@@ -378,11 +378,23 @@ def align_period(df, interval):
         ts = pd.to_datetime(t + SHIFT, unit="s")
         key = ts.year * 12 + ts.month
     key = np.asarray(key)
-    if len(np.unique(key)) == len(key):
-        return df
     out = (df.assign(k=key).groupby("k", sort=True)
              .agg(time=("time", "min"), open=("open", "first"), high=("high", "max"),
-                  low=("low", "min"), close=("close", "last")).reset_index(drop=True))
+                  low=("low", "min"), close=("close", "last")).reset_index())
+    out["time"] = out["time"].astype(np.int64)
+    # The row of the CURRENT day / week / month: on the first day of a new week (Monday) or month Yahoo sends only the
+    # 'latest price' row whose time = last trade time. That time changes every second, so the chart drew a NEW candle every
+    # second. Pin the running period's candle to the start of its period (09:15 IST) so its time never changes.
+    k = int(out["k"].iloc[-1])
+    if interval == "1d" or interval == "1wk":
+        start = k * 86400 - SHIFT + 9 * 3600 + 15 * 60
+    else:
+        y, m = (k - 1) // 12, (k - 1) % 12 + 1
+        start = int(pd.Timestamp(year=y, month=m, day=1).timestamp()) - SHIFT + 9 * 3600 + 15 * 60
+    prev = int(out["time"].iloc[-2]) if len(out) > 1 else None
+    if prev is None or start > prev:
+        out.loc[out.index[-1], "time"] = start
+    out = out.drop(columns="k")
     out["time"] = out["time"].astype(int)
     return out
 

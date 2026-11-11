@@ -1011,6 +1011,156 @@ def fib_swing(df, n_closed, N, sec):
                 x_hi=int(df.time[i_hi]) + SHIFT, x_lo=int(df.time[i_lo]) + SHIFT)
 
 
+# ---------------- option chain ----------------
+OC_SYMS = {"NIFTY": ("^NSEI", 50, "NIFTY 50"), "BANKNIFTY": ("^NSEBANK", 100, "BANK NIFTY")}
+OC_ROWS = 14                              # strikes shown on each side of the ATM
+oc_cache, oc_lock = {}, threading.Lock()
+oc_fail = {"until": 0.0, "err": ""}       # after an NSE failure the model chain is used for 2 minutes (no hammering of a blocking site)
+nse_sess = {"s": None, "t": 0.0}
+NSE_HEADERS = {"User-Agent": HEADERS["User-Agent"], "Accept": "application/json, text/plain, */*",
+               "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.nseindia.com/option-chain"}
+
+
+def nse_session(fresh=False):
+    if fresh or nse_sess["s"] is None or time.time() - nse_sess["t"] > 900:
+        s = requests.Session()
+        s.headers.update(NSE_HEADERS)
+        s.get("https://www.nseindia.com/option-chain", timeout=10)        # NSE only answers with the cookies of a normal page visit
+        nse_sess["s"], nse_sess["t"] = s, time.time()
+    return nse_sess["s"]
+
+
+def nse_get(path, params=None):
+    last = None
+    for fresh in (False, True):
+        try:
+            r = nse_session(fresh).get("https://www.nseindia.com" + path, params=params, timeout=12)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"NSE: {last}")
+
+
+def _oc_leg(x):
+    if not x:
+        return None
+    return dict(ltp=x.get("lastPrice"), chg=x.get("change"), oi=x.get("openInterest"), oichg=x.get("changeinOpenInterest"),
+                vol=x.get("totalTradedVolume"), iv=x.get("impliedVolatility"))
+
+
+def _oc_date(x):
+    try:
+        return dt.datetime.strptime(x, "%d-%b-%Y")
+    except Exception:
+        return dt.datetime.max
+
+
+def nse_chain(sym, exp=None):
+    exps = None
+    try:
+        exps = nse_get("/api/option-chain-contract-info", {"symbol": sym}).get("expiryDates")
+    except Exception:
+        pass
+    if exps and (not exp or exp not in exps):
+        exp = exps[0]
+    j = None
+    if exps:
+        try:
+            j = nse_get("/api/option-chain-v3", {"type": "Indices", "symbol": sym, "expiry": exp})
+        except Exception:
+            j = None
+    if not j or not (j.get("records") or {}).get("data"):
+        j = nse_get("/api/option-chain-indices", {"symbol": sym})        # older endpoint: every expiry in one answer
+    rec = j.get("records") or {}
+    data = rec.get("data") or []
+    if not data:
+        raise RuntimeError("NSE sent no option data")
+    if not exps:
+        exps = rec.get("expiryDates") or sorted({d["expiryDate"] for d in data if d.get("expiryDate")}, key=_oc_date)
+    if not exp or exp not in exps:
+        exp = exps[0]
+    rows = []
+    for d in data:
+        if d.get("expiryDate") and d["expiryDate"] != exp:
+            continue
+        rows.append(dict(strike=float(d["strikePrice"]), ce=_oc_leg(d.get("CE")), pe=_oc_leg(d.get("PE"))))
+    rows.sort(key=lambda r: r["strike"])
+    spot = rec.get("underlyingValue")
+    if not spot:
+        spot = next((d[k]["underlyingValue"] for d in data for k in ("CE", "PE") if d.get(k) and d[k].get("underlyingValue")), None)
+    if not rows or not spot:
+        raise RuntimeError("NSE answer had no strikes")
+    return dict(src="NSE", spot=float(spot), expiry=exp, expiries=list(exps)[:6], stamp=str(rec.get("timestamp") or ""), rows=rows)
+
+
+def model_chain(sym, exp=None):
+    """Fallback when NSE does not answer: Black-Scholes premiums with the India VIX as flat IV. No open interest."""
+    ysym, step, _ = OC_SYMS[sym]
+    spot = float(fetch("15m", ysym, recent=True).close.iloc[-1])
+    now_ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)
+    first = next_expiry(now_ist)
+    days = [first + dt.timedelta(days=7 * i) for i in range(4)]
+    labels = [d.strftime("%d-%b-%Y") for d in days]
+    if exp not in labels:
+        exp = labels[0]
+    end = dt.datetime.combine(days[labels.index(exp)], dt.time(15, 30))
+    T = max((end - now_ist.replace(tzinfo=None)).total_seconds() / (365 * 86400), 1 / (365 * 24))
+    iv = get_iv()
+    atm = int(round(spot / step) * step)
+    px = lambda v: round(round(v / 0.05) * 0.05, 2)
+    rows = []
+    for k in range(-OC_ROWS - 4, OC_ROWS + 5):
+        K = atm + k * step
+        rows.append(dict(strike=float(K),
+                         ce=dict(ltp=px(bs_price(spot, K, T, iv, True)), chg=None, oi=None, oichg=None, vol=None, iv=round(iv * 100, 1)),
+                         pe=dict(ltp=px(bs_price(spot, K, T, iv, False)), chg=None, oi=None, oichg=None, vol=None, iv=round(iv * 100, 1))))
+    return dict(src="MODEL", spot=spot, expiry=exp, expiries=labels, stamp="", rows=rows)
+
+
+def oc_summary(rows):
+    """PCR, max pain, strikes with the most CALL / PUT open interest (all strikes of the expiry, not only the shown ones)."""
+    oi = lambda r, k: float(((r.get(k) or {}).get("oi")) or 0)
+    ce_tot, pe_tot = sum(oi(r, "ce") for r in rows), sum(oi(r, "pe") for r in rows)
+    if ce_tot <= 0 and pe_tot <= 0:
+        return {}
+    pain = min(rows, key=lambda K: sum(oi(r, "ce") * max(0.0, K["strike"] - r["strike"]) + oi(r, "pe") * max(0.0, r["strike"] - K["strike"]) for r in rows))
+    return dict(ce_oi=ce_tot, pe_oi=pe_tot, pcr=round(pe_tot / ce_tot, 2) if ce_tot else None, pain=pain["strike"],
+                res=max(rows, key=lambda r: oi(r, "ce"))["strike"], sup=max(rows, key=lambda r: oi(r, "pe"))["strike"])
+
+
+def oc_view(sym, exp=""):
+    sym = sym if sym in OC_SYMS else "NIFTY"
+    key = (sym, exp or "")
+    c = oc_cache.get(key)
+    if c and time.time() - c["t"] < 15:
+        return c["j"]
+    with oc_lock:
+        c = oc_cache.get(key)
+        if c and time.time() - c["t"] < 15:
+            return c["j"]
+        out, note = None, ""
+        if time.time() >= oc_fail["until"]:
+            try:
+                out = nse_chain(sym, exp or None)
+            except Exception as e:
+                oc_fail.update(until=time.time() + 120, err=str(e)[:140])
+        if out is None:
+            note = oc_fail["err"] or "NSE not reachable"
+            out = model_chain(sym, exp or None)
+        step = OC_SYMS[sym][1]
+        rows = out["rows"]
+        atm = min(rows, key=lambda r: abs(r["strike"] - out["spot"]))["strike"]
+        i = [r["strike"] for r in rows].index(atm)
+        shown = rows[max(0, i - OC_ROWS): i + OC_ROWS + 1]
+        now_ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)
+        j = dict(sym=sym, name=OC_SYMS[sym][2], src=out["src"], note=note, spot=round(out["spot"], 2), atm=atm, expiry=out["expiry"],
+                 expiries=out["expiries"], stamp=out["stamp"], time=now_ist.strftime("%d-%b %H:%M:%S IST"),
+                 rows=shown, summary=oc_summary(rows) if out["src"] == "NSE" else {})
+        oc_cache[key] = {"j": j, "t": time.time()}
+        return j
+
+
 def fib_view(tf, sym):
     if tf not in TFS:
         tf = "1h"
@@ -1948,6 +2098,12 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
 #fbox td:nth-child(n+2),#fbox th:nth-child(n+2){text-align:right}
 #fbox tr.lv td{font-weight:500;color:var(--st)}
 #fbox tr.here td{background:var(--bg2)}
+#obox table{width:100%;border-collapse:collapse;margin-top:6px;font-size:12px}
+#obox th,#obox td{padding:5px 3px;text-align:right;border-top:1px solid var(--bd);font-weight:400;white-space:nowrap}
+#obox th{color:var(--mu);font-size:11px}
+#obox td.k{text-align:center;font-weight:500;color:var(--st);background:var(--bg2)}
+#obox tr.atm td.k{background:var(--or);color:#fff}
+#obox .warn{border:1px solid var(--or);border-radius:3px;padding:6px 8px;margin:6px 0;font-size:12px;color:var(--st)}
 </style></head><body>
 <div id="app">
 <div id="hd"><span id="brand">Nifty Live</span><div id="strip"></div><button id="b_prof" onclick="openSettings()" aria-label="Profile and settings" title="Profile and settings"></button></div>
@@ -2049,6 +2205,17 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
       <p>The chart is the running total after each closed trade (blue). The red area is the drawdown (the gap below the previous peak). Rs = points x lot size (65) for 1 lot. % of capital uses your capital setting (default Rs 85,000, change with <b>CAPITAL</b> on Render). Points are Nifty index points, <b>not</b> the P&amp;L of the hedged option plan, and no costs are included.</p>
     </div>
   </div></section>
+  <section class="view" id="v_opt"><div class="pad">
+    <h3>Option chain</h3>
+    <div class="scrollx" id="osym" style="padding-left:0"></div>
+    <div class="scrollx" id="oexp" style="padding-left:0"></div>
+    <div id="obox" class="jbox" style="margin-top:6px"><span class="mu">loading...</span></div>
+    <div class="how">
+      <p><b>How it works:</b> the table shows the strikes around the ATM (orange) with the CALL side on the left and the PUT side on the right. <b>OI</b> = open interest (contracts), <b>chg</b> = change in OI today, the shaded bar behind OI = how big it is compared with the other strikes. Shaded cells are in-the-money.</p>
+      <p><b>PCR</b> = total PUT OI / total CALL OI (above 1 = more puts written, often read as supportive; below 0.7 = more calls, often read as heavy). <b>Max pain</b> = the strike where option writers lose the least at expiry. <b>Resistance</b> = strike with the most CALL OI, <b>Support</b> = strike with the most PUT OI. These are only reference levels, not signals.</p>
+      <p>Data is the free NSE option chain, refreshed every 15 s. If NSE does not answer (it often blocks cloud servers) the table switches to a clearly marked <b>ESTIMATE</b> (Black-Scholes with India VIX, no OI) so you can still see approximate premiums.</p>
+    </div>
+  </div></section>
   <section class="view" id="v_jrnl"><div class="pad">
     <h3>Signal journal - NIFTY 50</h3>
     <div class="scrollx" id="jsrc" style="padding-left:0"></div>
@@ -2073,6 +2240,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   <button id="n_fib" onclick="setView('fib')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h16"/><path d="M8 19L16 5"/></svg>Fib</button>
   <button id="n_plan15" onclick="setView('plan15')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="4" width="12" height="17" rx="1.5"/><path d="M9.5 3.5h5M9 10h6M9 14h6"/></svg>Plan 15m</button>
   <button id="n_plan" onclick="setView('plan')"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="4" width="12" height="17" rx="1.5"/><path d="M9.5 3.5h5M9 10h6M9 14h6"/></svg>Plan 1h</button>
+  <button id="n_opt" onclick="setView('opt')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><path d="M12 4v16"/></svg>Options</button>
   <button id="n_jrnl" onclick="setView('jrnl')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h11a2 2 0 012 2v14H8a2 2 0 01-2-2z"/><path d="M6 18a2 2 0 012-2h11"/></svg>Journal</button>
   <button id="n_dd" onclick="setView('dd')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5l6 7 4-3 8 10"/><path d="M21 13v6h-6"/></svg>Drawdown</button>
   <button id="n_news" onclick="setView('news')"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h12v14H7a2 2 0 01-2-2z"/><path d="M17 9h2.5v8a2 2 0 01-2 2"/><path d="M8 9h6M8 13h6"/></svg>News<i id="ndot"></i></button>
@@ -2152,7 +2320,7 @@ function fixRange(){
 function setView(v){
   if (wide() && v === 'watch') v = 'chart';
   view = v; if (v !== 'set') ss('view', v);                       // settings is a side screen: reopening the app returns to the last tab
-  ['watch','chart','sigs','fib','plan15','plan','jrnl','dd','news','set'].forEach(x => {
+  ['watch','chart','sigs','fib','plan15','plan','opt','jrnl','dd','news','set'].forEach(x => {
     $('v_' + x).classList.toggle('on', x === v);
     if ($('n_' + x)) $('n_' + x).classList.toggle('on', x === v);
   });
@@ -2160,6 +2328,7 @@ function setView(v){
   if (v === 'chart') setTimeout(fixRange, 80);
   if (v === 'jrnl') loadJournal();
   if (v === 'dd') loadDD();
+  if (v === 'opt') loadOpt();
   if (v === 'fib') loadFib();
   if (v === 'news'){ ss('nseen', String(Math.floor(Date.now() / 1000))); $('ndot').style.display = 'none'; loadNews(); if (nview === 'ev') loadEvents(); }
   if (v === 'set'){ $('pname').value = profName(); drawProfile(); loadAlerts(); }
@@ -3104,6 +3273,75 @@ function ddSvg(curve){                                              // running t
     + '<polygon points="' + area + '" fill="#df514c" fill-opacity=".35"/>'
     + '<polyline points="' + eq + '" fill="none" stroke="#2962ff" stroke-width="1.6" stroke-linejoin="round"/></svg>';
 }
+let osym = ls('osym', 'NIFTY'), oexp = '', oBusy = false, oScrolled = '';
+function drawOptTabs(){
+  const a = $('osym'); a.innerHTML = '';
+  [['NIFTY', 'NIFTY 50'], ['BANKNIFTY', 'BANK NIFTY']].forEach(x => {
+    const b = document.createElement('button'); b.className = 'btn' + (x[0] === osym ? ' on' : ''); b.textContent = x[1];
+    b.onclick = () => { osym = x[0]; ss('osym', osym); oexp = ''; drawOptTabs(); $('oexp').innerHTML = ''; $('obox').innerHTML = '<span class="mu">loading...</span>'; loadOpt(); };
+    a.appendChild(b);
+  });
+}
+const oiF = v => v == null ? '-' : (Math.abs(v) >= 1e5 ? (v / 1e5).toFixed(2) + 'L' : Math.abs(v) >= 1e3 ? (v / 1e3).toFixed(1) + 'K' : String(Math.round(v)));
+const oChg = v => v == null ? '' : '<span class="' + (v > 0 ? 'up' : v < 0 ? 'dn' : 'mu') + '">' + (v > 0 ? '+' : '') + oiF(v) + '</span>';
+const oPx = v => v == null ? '-' : Number(v).toFixed(2);
+function drawOpt(j){
+  const ex = $('oexp'); ex.innerHTML = '';
+  (j.expiries || []).forEach(e => {
+    const b = document.createElement('button'); b.className = 'btn' + (e === j.expiry ? ' on' : ''); b.textContent = e.replace(/-(\d{4})$/, '');
+    b.onclick = () => { oexp = e; $('obox').innerHTML = '<span class="mu">loading...</span>'; loadOpt(); };
+    ex.appendChild(b);
+  });
+  const real = j.src === 'NSE', S = j.summary || {};
+  let h = '<span class="mu">' + (j.name || j.sym) + ' | spot <b style="color:var(--st)">' + fmt(j.spot) + '</b> | ATM <b style="color:var(--st)">' + Math.round(j.atm).toLocaleString('en-IN') + '</b> | expiry ' + j.expiry
+    + '<br>' + (real ? 'NSE data' + (j.stamp ? ' as of ' + j.stamp : '') : '') + ' | updated ' + j.time + '</span>';
+  if (!real) h += '<div class="warn"><b>ESTIMATE, not real prices.</b> NSE did not answer' + (j.note ? ' (' + j.note + ')' : '') + ', so these premiums are a Black-Scholes model with India VIX. There is no OI / PCR in this mode.</div>';
+  if (real && S.pcr != null){
+    h += '<div class="jgrid">'
+      + jcell('PCR', '<span class="' + (S.pcr >= 1 ? 'up' : S.pcr < 0.7 ? 'dn' : '') + '">' + S.pcr.toFixed(2) + '</span>')
+      + jcell('Max pain', Math.round(S.pain).toLocaleString('en-IN'))
+      + jcell('Total OI', '<span class="dn">C ' + oiF(S.ce_oi) + '</span> <span class="up">P ' + oiF(S.pe_oi) + '</span>')
+      + jcell('Resistance (max CALL OI)', '<span class="dn">' + Math.round(S.res).toLocaleString('en-IN') + '</span>')
+      + jcell('Support (max PUT OI)', '<span class="up">' + Math.round(S.sup).toLocaleString('en-IN') + '</span>')
+      + jcell('PUT - CALL OI', oChg(S.pe_oi - S.ce_oi))
+      + '</div>';
+  }
+  const rows = j.rows || [];
+  const mx = Math.max(1, ...rows.map(r => Math.max((r.ce && r.ce.oi) || 0, (r.pe && r.pe.oi) || 0)));
+  const bar = (v, col, side, itm) => {
+    const w = v ? Math.max(2, Math.round(v / mx * 100)) : 0;
+    return 'background:' + (w ? 'linear-gradient(to ' + side + ',' + col + ' ' + w + '%,transparent ' + w + '%)' + (itm ? ',var(--bg2)' : '') : (itm ? 'var(--bg2)' : 'none'));
+  };
+  h += '<table><tr><th>OI chg</th><th>OI</th><th>LTP</th><th style="text-align:center">Strike</th><th style="text-align:left">LTP</th><th style="text-align:left">OI</th><th style="text-align:left">OI chg</th></tr>';
+  rows.forEach(r => {
+    const c = r.ce || {}, p = r.pe || {}, atm = r.strike === j.atm;
+    const ceItm = r.strike < j.spot, peItm = r.strike > j.spot;
+    h += '<tr' + (atm ? ' class="atm"' : '') + '>'
+      + '<td style="' + bar(0, '', 'left', ceItm) + '">' + oChg(c.oichg) + '</td>'
+      + '<td style="' + bar(c.oi, 'rgba(223,81,76,.28)', 'left', ceItm) + '">' + oiF(c.oi) + '</td>'
+      + '<td style="' + bar(0, '', 'left', ceItm) + '">' + oPx(c.ltp) + '</td>'
+      + '<td class="k">' + Math.round(r.strike).toLocaleString('en-IN') + '</td>'
+      + '<td style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oPx(p.ltp) + '</td>'
+      + '<td style="text-align:left;' + bar(p.oi, 'rgba(76,175,80,.28)', 'right', peItm) + '">' + oiF(p.oi) + '</td>'
+      + '<td style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oChg(p.oichg) + '</td></tr>';
+  });
+  $('obox').innerHTML = h + '</table>';
+  const ak = osym + '|' + j.expiry;
+  if (oScrolled !== ak){ oScrolled = ak; const ar = document.querySelector('#obox tr.atm'); if (ar) setTimeout(() => ar.scrollIntoView({block: 'center'}), 50); }     // first time: bring the ATM row to the middle
+}
+async function loadOpt(){
+  if (oBusy) return;
+  oBusy = true;
+  const want = osym;
+  try{
+    const r = await fetch('/options?sym=' + osym + '&exp=' + encodeURIComponent(oexp) + '&_=' + Date.now());
+    const j = await r.json();
+    if (want !== osym) return;
+    if (j.error){ $('obox').innerHTML = '<span class="mu">Could not load (' + j.error + ').</span>'; return; }
+    oexp = j.expiry; drawOpt(j);
+  } catch(e){ $('obox').innerHTML = '<span class="mu">Could not load, trying again...</span>'; }
+  finally { oBusy = false; }
+}
 async function loadDD(){
   const el = $('dbox');
   try{
@@ -3128,6 +3366,7 @@ async function loadDD(){
   } catch(e){ if (!el.innerHTML || el.innerHTML.indexOf('loading') >= 0) el.innerHTML = '<span class="mu">Could not load (connection problem).</span>'; }
 }
 drawDTabs(); setInterval(() => { if (view === 'dd') loadDD(); }, 20000);
+drawOptTabs(); setInterval(() => { if (view === 'opt' && !document.hidden) loadOpt(); }, 15000);
 drawNSeg(); loadNews(); setInterval(loadNews, 90000);
 setInterval(() => { if (view === 'news' && nview === 'ev') loadEvents(); }, 60000);
 loadQuotes(); setInterval(loadQuotes, 5000);
@@ -3811,6 +4050,13 @@ class Handler(BaseHTTPRequestHandler):
             if time.time() - jmeta["updated"] > 120 and not jupd_lock.locked():
                 journal_refresh()
             self._send(200, "application/json", json.dumps(dd_view(days, q.get("src", ["ST"])[0])).encode("utf-8"))
+        elif u.path == "/options":
+            q = parse_qs(u.query)
+            try:
+                j = oc_view(q.get("sym", ["NIFTY"])[0].upper(), q.get("exp", [""])[0])
+            except Exception as e:
+                j = {"error": str(e)[:200]}
+            self._send(200, "application/json", json.dumps(j).encode("utf-8"))
         elif u.path == "/journal.csv":
             body = journal_csv().encode("utf-8")
             self.send_response(200)

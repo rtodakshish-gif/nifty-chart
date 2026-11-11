@@ -965,6 +965,19 @@ def fib_swing(df, n_closed, N, sec):
     follow the move that is running now.
     dir = "up" (low -> high: levels are pullbacks measured DOWN from the high) or "down" (high -> low: bounces UP from the low)."""
     high, low = df.high.values, df.low.values
+    if 0 < sec <= 1800 and len(df) >= 3:
+        # 1m ... 30m: the levels follow TODAY's move (session low <-> session high, running candle included), like a Fibonacci
+        # drawn by hand on the day's candles. With confirmed 5-candle pivots the leg started on a previous day and its
+        # 0.5 / 0.618 lines sat hundreds of points below the price, outside the screen, until 5 more candles were done.
+        day = (df["time"].astype("int64").values + SHIFT) // 86400
+        a0 = int(np.argmax(day == day[-1]))
+        if len(df) - a0 >= 3:
+            i_hi = a0 + int(np.argmax(high[a0:]))
+            i_lo = a0 + int(np.argmin(low[a0:]))
+            if float(high[i_hi] - low[i_lo]) >= 0.003 * float(df.close.iloc[-1]):
+                return dict(dir="up" if i_lo < i_hi else "down", hi=round(float(high[i_hi]), 2), lo=round(float(low[i_lo]), 2),
+                            t_hi=fmt_sig_time(int(df.time[i_hi]), sec), t_lo=fmt_sig_time(int(df.time[i_lo]), sec),
+                            x_hi=int(df.time[i_hi]) + SHIFT, x_lo=int(df.time[i_lo]) + SHIFT)
     ph = [j for j in range(N, n_closed - N) if high[j] >= high[j - N:j + N + 1].max()]
     pl = [j for j in range(N, n_closed - N) if low[j] <= low[j - N:j + N + 1].min()]
     if not ph or not pl:

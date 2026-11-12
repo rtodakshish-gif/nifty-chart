@@ -1047,7 +1047,7 @@ def _oc_leg(x):
     if not x:
         return None
     return dict(ltp=x.get("lastPrice"), chg=x.get("change"), oi=x.get("openInterest"), oichg=x.get("changeinOpenInterest"),
-                vol=x.get("totalTradedVolume"), iv=x.get("impliedVolatility"))
+                vol=x.get("totalTradedVolume"), iv=x.get("impliedVolatility"), bid=x.get("bidprice"), ask=x.get("askPrice"))
 
 
 def _oc_date(x):
@@ -1119,15 +1119,118 @@ def model_chain(sym, exp=None):
     return dict(src="MODEL", spot=spot, expiry=exp, expiries=labels, stamp="", rows=rows)
 
 
-def oc_summary(rows):
-    """PCR, max pain, strikes with the most CALL / PUT open interest (all strikes of the expiry, not only the shown ones)."""
+def oc_summary(rows, spot):
+    """PCR, max pain and the OI walls: RESISTANCE = strikes ABOVE the spot with the most CALL open interest (call writers defend
+    them), SUPPORT = strikes BELOW the spot with the most PUT open interest. Top 3 each (all strikes of the expiry)."""
     oi = lambda r, k: float(((r.get(k) or {}).get("oi")) or 0)
     ce_tot, pe_tot = sum(oi(r, "ce") for r in rows), sum(oi(r, "pe") for r in rows)
     if ce_tot <= 0 and pe_tot <= 0:
         return {}
     pain = min(rows, key=lambda K: sum(oi(r, "ce") * max(0.0, K["strike"] - r["strike"]) + oi(r, "pe") * max(0.0, r["strike"] - K["strike"]) for r in rows))
+
+    def walls(key, above):
+        xs = [(r["strike"], r.get(key) or {}) for r in rows if (r["strike"] > spot if above else r["strike"] < spot) and ((r.get(key) or {}).get("oi") or 0) > 0]
+        xs.sort(key=lambda x: -x[1]["oi"])
+        top = xs[:3]
+        mx = top[0][1]["oi"] if top else 0
+        lst = [dict(strike=k, oi=l["oi"], oichg=l.get("oichg"), strong=l["oi"] >= 0.7 * mx) for k, l in top]
+        lst.sort(key=lambda x: x["strike"] if above else -x["strike"])          # R1 / S1 = the nearest wall
+        return lst, (top[0][0] if top else None)
+    res_l, res = walls("ce", True)
+    sup_l, sup = walls("pe", False)
     return dict(ce_oi=ce_tot, pe_oi=pe_tot, pcr=round(pe_tot / ce_tot, 2) if ce_tot else None, pain=pain["strike"],
-                res=max(rows, key=lambda r: oi(r, "ce"))["strike"], sup=max(rows, key=lambda r: oi(r, "pe"))["strike"])
+                res=res, sup=sup, res_l=res_l, sup_l=sup_l)
+
+
+def prob_otm(spot, K, T, iv, call):
+    """Chance (Black-Scholes, risk-neutral) that the option sold at strike K expires worthless."""
+    d2 = (math.log(spot / K) + (RISK_FREE - iv * iv / 2) * T) / (iv * math.sqrt(T))
+    return _ncdf(-d2) if call else _ncdf(d2)
+
+
+def oc_reco(rows, spot, expiry, bias, S, src):
+    """Hedged option-selling ideas from the chain. For each side up to two ideas:
+    'wall'  = the strike AT / BEYOND an OI wall (the price must break the wall first; the premium is lower),
+    'plan'  = the liquid strike whose premium is nearest SELL_PREMIUM (Rs 200, your plan; usually closer to the spot).
+    The hedge is the far strike with a premium nearest HEDGE_PREMIUM (Rs 35)."""
+    now_ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)
+    ed = _oc_date(expiry)
+    if ed == dt.datetime.max:
+        return []
+    T = max((ed.replace(hour=15, minute=30) - now_ist.replace(tzinfo=None)).total_seconds() / (365 * 86400), 1 / (365 * 24))
+    dleft = (ed.date() - now_ist.date()).days
+    iv0 = get_iv()
+    bdir = (bias or {}).get("dir", 0)
+    out = []
+    for call in (False, True):
+        key, side = ("ce", "CE") if call else ("pe", "PE")
+        legs = [(r["strike"], r[key]) for r in rows if (r.get(key) or {}).get("ltp") and float(r[key]["ltp"]) > 0
+                and ((r["strike"] > spot) if call else (r["strike"] < spot))]
+        legs.sort(key=lambda x: x[0] if call else -x[0])                        # nearest to the spot first
+        if len(legs) < 4:
+            continue
+        mxoi = max([(l.get("oi") or 0) for _, l in legs] or [0])
+        walls = [x["strike"] for x in ((S.get("res_l") if call else S.get("sup_l")) or [])]
+        wall_k = S.get("res" if call else "sup")
+        is_beyond = lambda K: any((K >= w) if call else (K <= w) for w in walls)
+
+        def liquid(l):
+            p = float(l["ltp"])
+            bid, ask = l.get("bid"), l.get("ask")
+            if bid and ask and (ask - bid) / p > 0.08:                          # wide bid/ask = bad fills
+                return False
+            return not (mxoi and (l.get("oi") or 0) < 0.05 * mxoi)             # nobody trades it
+
+        def card(sK, sl, kind):
+            far = [(K, l) for K, l in legs if ((K > sK) if call else (K < sK))]
+            if not far:
+                return None
+            hK, hl = min(far, key=lambda x: abs(float(x[1]["ltp"]) - HEDGE_PREMIUM))
+            sp, hp = float(sl["ltp"]), float(hl["ltp"])
+            if hp >= sp:
+                return None
+            width, credit = abs(hK - sK), sp - hp
+            iv = float(sl.get("iv") or 0) / 100 or iv0
+            prob = prob_otm(spot, sK, T, iv, call)
+            nm = "CALL" if call else "PUT"
+            why = [f"Sold strike is {abs(sK - spot):.0f} pts ({abs(sK - spot) / spot * 100:.1f}%) {'above' if call else 'below'} the spot, about {prob * 100:.0f}% chance to expire worthless."]
+            if walls:
+                why.append(f"At / beyond the {nm} OI wall ({', '.join(f'{w:,.0f}' for w in walls)}): the price has to break the wall first." if is_beyond(sK)
+                           else f"Inside the OI wall: the strongest {nm} OI wall is {wall_k:,.0f}, so the price can reach this strike without breaking it.")
+            warn = []
+            if sp < 0.5 * SELL_PREMIUM:
+                warn.append(f"Premium is below your usual Rs {SELL_PREMIUM}: safer, but less credit.")
+            if dleft <= 0:
+                warn.append("Expiry day: premium melts fast but a small move can hit the stop-loss quickly.")
+            if src != "NSE":
+                warn.append("ESTIMATED premiums (NSE did not answer): check real prices in Kite before trading.")
+            ml = max(0.0, width - credit) * LOT
+            return dict(side=side, kind=kind, fav=(bdir == -1) if call else (bdir == 1), sell_strike=int(sK), sell_prem=round(sp, 2),
+                        hedge_strike=int(hK), hedge_prem=round(hp, 2), credit_pts=round(credit, 2), credit=int(credit * LOT), max_loss=int(ml),
+                        max_loss_pct=round(ml / CAPITAL * 100, 1) if CAPITAL else None, width=int(width),
+                        breakeven=round(sK + credit if call else sK - credit, 2), sl_prem=round(sp * (1 + PREMIUM_SL_PCT / 100), 2),
+                        tgt_prem=round(sp * 0.5, 2), prob=round(prob * 100), iv=round(iv * 100, 1), bid=sl.get("bid"), ask=sl.get("ask"),
+                        why=why, warn=warn)
+
+        ok = [(K, l) for K, l in legs if liquid(l)]
+        wall_pick = [(K, l) for K, l in ok if is_beyond(K) and float(l["ltp"]) >= 0.25 * SELL_PREMIUM]
+        plan_pick = [(K, l) for K, l in ok if 0.4 * SELL_PREMIUM <= float(l["ltp"]) <= 1.8 * SELL_PREMIUM] or ok or legs
+        picks = []
+        if wall_pick:
+            picks.append(("wall",) + min(wall_pick, key=lambda x: abs(float(x[1]["ltp"]) - SELL_PREMIUM)))
+        pk = min(plan_pick, key=lambda x: abs(float(x[1]["ltp"]) - SELL_PREMIUM))
+        if not picks or picks[0][1] != pk[0]:
+            picks.append(("plan",) + pk)
+        else:
+            picks[0] = ("wall+plan",) + picks[0][1:]
+        for kind, K, l in picks:
+            c = card(K, l, kind)
+            if c:
+                if kind == "plan" and float(l["ltp"]) < 0.4 * SELL_PREMIUM:
+                    c["warn"].insert(0, f"No liquid strike near Rs {SELL_PREMIUM} premium: the closest one is shown (premiums are low today).")
+                out.append(c)
+    out.sort(key=lambda x: (not x["fav"], x["side"], 0 if x["kind"].startswith("wall") else 1))
+    return out
 
 
 def oc_view(sym, exp=""):
@@ -1155,9 +1258,20 @@ def oc_view(sym, exp=""):
         i = [r["strike"] for r in rows].index(atm)
         shown = rows[max(0, i - OC_ROWS): i + OC_ROWS + 1]
         now_ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)
+        S = oc_summary(rows, out["spot"]) if out["src"] == "NSE" else {}
+        reco, bias = [], None
+        if sym == "NIFTY":                                    # the sizes (lot 65, Rs 200 / Rs 35 premiums) are those of the Nifty plan
+            try:
+                try:
+                    bias = bias_for("^NSEI")
+                except Exception:
+                    bias = None
+                reco = oc_reco(rows, out["spot"], out["expiry"], bias, S, out["src"])
+            except Exception as e:
+                print("option reco note:", e)
         j = dict(sym=sym, name=OC_SYMS[sym][2], src=out["src"], note=note, spot=round(out["spot"], 2), atm=atm, expiry=out["expiry"],
                  expiries=out["expiries"], stamp=out["stamp"], time=now_ist.strftime("%d-%b %H:%M:%S IST"),
-                 rows=shown, summary=oc_summary(rows) if out["src"] == "NSE" else {})
+                 rows=shown, summary=S, reco=reco, lot=LOT, sell_prem=SELL_PREMIUM, trend=(bias or {}).get("label"), trend_ok=bias is not None)
         oc_cache[key] = {"j": j, "t": time.time()}
         return j
 
@@ -2104,6 +2218,13 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
 #obox th{color:var(--mu);font-size:11px}
 #obox td.k{text-align:center;font-weight:500;color:var(--st);background:var(--bg2)}
 #obox tr.atm td.k{background:var(--or);color:#fff}
+#obox .rc{border:1px solid var(--bd);border-radius:3px;padding:8px 9px;margin:8px 0;font-size:12.5px;color:var(--tx)}
+#obox .rc.fav{border-color:var(--up)}
+#obox .rc h5{margin:0 0 4px;font-size:13.5px;font-weight:500;color:var(--st)}
+#obox .rc ul{margin:4px 0 0;padding-left:16px;color:var(--mu);font-size:12px}
+#obox .rc .kv{display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;margin:5px 0}
+#obox .rc .kv span{color:var(--mu)}#obox .rc .kv b{font-weight:500;color:var(--st)}
+#obox .rt{font-size:9px;font-weight:600;margin-left:3px;padding:0 3px;border-radius:2px;color:#fff;vertical-align:1px}
 #obox .warn{border:1px solid var(--or);border-radius:3px;padding:6px 8px;margin:6px 0;font-size:12px;color:var(--st)}
 </style></head><body>
 <div id="app">
@@ -3302,10 +3423,39 @@ function drawOpt(j){
       + jcell('PCR', '<span class="' + (S.pcr >= 1 ? 'up' : S.pcr < 0.7 ? 'dn' : '') + '">' + S.pcr.toFixed(2) + '</span>')
       + jcell('Max pain', Math.round(S.pain).toLocaleString('en-IN'))
       + jcell('Total OI', '<span class="dn">C ' + oiF(S.ce_oi) + '</span> <span class="up">P ' + oiF(S.pe_oi) + '</span>')
-      + jcell('Resistance (max CALL OI)', '<span class="dn">' + Math.round(S.res).toLocaleString('en-IN') + '</span>')
-      + jcell('Support (max PUT OI)', '<span class="up">' + Math.round(S.sup).toLocaleString('en-IN') + '</span>')
+      + jcell('Resistance (max CALL OI)', '<span class="dn">' + (S.res != null ? Math.round(S.res).toLocaleString('en-IN') : '-') + '</span>')
+      + jcell('Support (max PUT OI)', '<span class="up">' + (S.sup != null ? Math.round(S.sup).toLocaleString('en-IN') : '-') + '</span>')
       + jcell('PUT - CALL OI', oChg(S.pe_oi - S.ce_oi))
       + '</div>';
+  }
+  if (real && (S.res_l || S.sup_l)){
+    const wl = (a, nm, cls) => (a && a.length ? a.map((x, i) => nm + (i + 1) + ' <b class="' + cls + '">' + Math.round(x.strike).toLocaleString('en-IN') + '</b> <span class="mu">(' + oiF(x.oi) + (x.oichg != null ? ', ' + (x.oichg > 0 ? '+' : '') + oiF(x.oichg) : '') + ')' + (x.strong ? ' strong' : '') + '</span>').join(' &nbsp; ') : '<span class="mu">-</span>');
+    h += '<div style="font-size:12.5px;margin:6px 0;line-height:1.7"><span class="mu">Resistance (CALL OI, above spot)</span><br>' + wl(S.res_l, 'R', 'dn')
+      + '<br><span class="mu">Support (PUT OI, below spot)</span><br>' + wl(S.sup_l, 'S', 'up') + '</div>';
+  }
+  const tag = {};
+  if (real){ (S.res_l || []).forEach((x, i) => tag[x.strike] = ['R' + (i + 1), '#df514c']); (S.sup_l || []).forEach((x, i) => tag[x.strike] = ['S' + (i + 1), '#4caf50']); }
+  if (j.reco && j.reco.length){
+    const rs = v => 'Rs ' + Math.round(v).toLocaleString('en-IN'), SELLP = j.sell_prem || 200;
+    h += '<h3 style="margin:12px 0 2px">Option selling ideas (hedged)</h3><span class="mu" style="font-size:12px">Trend filter (1H + 4H): <b>' + (j.trend_ok ? (j.trend === 'BULL' ? 'BULL - sell PE side' : j.trend === 'BEAR' ? 'BEAR - sell CE side' : 'NO CLEAR TREND') : 'unknown') + '</b>. 1 lot = ' + j.lot + '. Expiry ' + j.expiry + '.</span>';
+    j.reco.forEach(x => {
+      const ce = x.side === 'CE';
+      const kn = x.kind === 'wall' ? 'at the OI wall (safer)' : x.kind === 'plan' ? 'about Rs ' + Math.round(SELLP) + ' premium (your plan)' : 'OI wall + your Rs ' + Math.round(SELLP) + ' plan';
+      h += '<div class="rc' + (x.fav ? ' fav' : '') + '"><h5>SELL ' + (ce ? 'CALL (CE)' : 'PUT (PE)') + ' - ' + kn + '</h5>'
+        + '<span style="font-size:11.5px">' + (x.fav ? '<span class="up">matches the 1H + 4H trend</span>' : '<span class="mu">against the trend / range-bound only</span>') + '</span><br>'
+        + '<b>SELL ' + x.sell_strike.toLocaleString('en-IN') + ' ' + x.side + '</b> @ ' + x.sell_prem.toFixed(2) + ' &nbsp; + &nbsp; <b>BUY ' + x.hedge_strike.toLocaleString('en-IN') + ' ' + x.side + '</b> @ ' + x.hedge_prem.toFixed(2)
+        + (x.bid && x.ask ? '<br><span class="mu">sold option bid ' + x.bid + ' / ask ' + x.ask + '</span>' : '')
+        + '<div class="kv"><span>Net credit</span><b class="up">' + x.credit_pts.toFixed(1) + ' pts = ' + rs(x.credit) + '</b>'
+        + '<span>Max loss (hedged)</span><b class="dn">' + rs(x.max_loss) + (x.max_loss_pct != null ? ' (' + x.max_loss_pct + '% of capital)' : '') + '</b>'
+        + '<span>Breakeven</span><b>' + Math.round(x.breakeven).toLocaleString('en-IN') + '</b>'
+        + '<span>Chance to expire OTM</span><b>~' + x.prob + '%</b>'
+        + '<span>Stop-loss (sold option)</span><b class="dn">' + x.sl_prem.toFixed(0) + '</b>'
+        + '<span>Target (buy back)</span><b class="up">' + x.tgt_prem.toFixed(0) + '</b></div>'
+        + '<ul>' + x.why.concat(x.warn).map(w => '<li>' + w + '</li>').join('') + '</ul></div>';
+    });
+    h += '<div class="mu" style="font-size:11.5px">Ideas from the option chain, not advice. Buy the hedge first, sell after. Check margin and the real price in Kite before placing.</div>';
+  } else if (j.sym === 'NIFTY'){
+    h += '<div class="mu" style="font-size:12px;margin-top:8px">No option selling idea right now (no liquid strike found).</div>';
   }
   const rows = j.rows || [];
   const mx = Math.max(1, ...rows.map(r => Math.max((r.ce && r.ce.oi) || 0, (r.pe && r.pe.oi) || 0)));
@@ -3321,7 +3471,7 @@ function drawOpt(j){
       + '<td style="' + bar(0, '', 'left', ceItm) + '">' + oChg(c.oichg) + '</td>'
       + '<td style="' + bar(c.oi, 'rgba(223,81,76,.28)', 'left', ceItm) + '">' + oiF(c.oi) + '</td>'
       + '<td style="' + bar(0, '', 'left', ceItm) + '">' + oPx(c.ltp) + '</td>'
-      + '<td class="k">' + Math.round(r.strike).toLocaleString('en-IN') + '</td>'
+      + '<td class="k">' + Math.round(r.strike).toLocaleString('en-IN') + (tag[r.strike] ? '<i class="rt" style="background:' + tag[r.strike][1] + '">' + tag[r.strike][0] + '</i>' : '') + '</td>'
       + '<td style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oPx(p.ltp) + '</td>'
       + '<td style="text-align:left;' + bar(p.oi, 'rgba(76,175,80,.28)', 'right', peItm) + '">' + oiF(p.oi) + '</td>'
       + '<td style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oChg(p.oichg) + '</td></tr>';

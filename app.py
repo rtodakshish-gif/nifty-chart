@@ -792,6 +792,7 @@ def sr_fresh(df, n, atr, have, tol, K=2, back=60):
         if high[j] >= high[max(0, j - K):hi_k].max() and high[j] - float(low[j + 1:n].min()) >= a:
             found.append(float(high[j]))
     found.sort()
+    tol = 0.3 * a                    # tight: two different swing highs (e.g. 25,380 and 25,431) must stay two levels, not become one average
     out, cur = [], []
     for p in found + [None]:
         if p is not None and (not cur or p - cur[0] <= tol):
@@ -800,7 +801,7 @@ def sr_fresh(df, n, atr, have, tol, K=2, back=60):
         if cur:
             px = sum(cur) / len(cur)
             if all(abs(px - x["price"]) > tol for x in have):
-                out.append(dict(price=round(px, 2), touches=max(1, min(len(cur), 1))))
+                out.append(dict(price=round(px, 2), touches=len(cur)))
         cur = [p] if p is not None else []
     return out
 

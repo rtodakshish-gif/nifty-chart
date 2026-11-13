@@ -959,6 +959,9 @@ def find_ema_buys(df, d, n_closed):
     return out
 
 
+FIB_1H_SESSIONS = 5                      # 1h chart: Fibonacci leg = lowest low / highest high of the last 5 sessions
+
+
 def fib_swing(df, n_closed, N, sec):
     """Leg the Fibonacci levels are measured on (closed-candle pivots, N candles on each side).
     Candidates: the leg that ended at the latest pivot, and the leg before it. The BIGGER one wins, so a small pullback
@@ -980,11 +983,11 @@ def fib_swing(df, n_closed, N, sec):
                             t_hi=fmt_sig_time(int(df.time[i_hi]), sec), t_lo=fmt_sig_time(int(df.time[i_lo]), sec),
                             x_hi=int(df.time[i_hi]) + SHIFT, x_lo=int(df.time[i_lo]) + SHIFT)
     if sec == 3600 and len(df) >= 10:
-        # 1h: the levels follow the move of the LAST 7 SESSIONS (lowest low <-> highest high, running candle included), so the 0.5 / 0.618
+        # 1h: the levels follow the move of the LAST FIB_1H_SESSIONS (5) SESSIONS (lowest low <-> highest high, running candle included), so the 0.5 / 0.618
         # lines sit near the price and update live. The 5-candle pivots of the old logic gave a leg of weeks and the lines went off-screen.
         days = (df["time"].astype("int64").values + SHIFT) // 86400
         ud = np.unique(days)
-        a0 = int(np.argmax(days >= ud[max(0, len(ud) - 7)]))
+        a0 = int(np.argmax(days >= ud[max(0, len(ud) - FIB_1H_SESSIONS)]))
         i_hi = a0 + int(np.argmax(high[a0:]))
         i_lo = a0 + int(np.argmin(low[a0:]))
         if float(high[i_hi] - low[i_lo]) >= 0.005 * float(df.close.iloc[-1]):

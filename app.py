@@ -607,6 +607,42 @@ def market_status():
     return "OPEN" if open_now else "CLOSED"
 
 
+def swing_points(df, n_closed, t, N):
+    """Zig-zag of confirmed swings (pivot with N candles each side), alternating high / low, each named by comparing it with the
+    previous swing of the same kind: HH / LH for highs, HL / LL for lows."""
+    high, low = df.high.values, df.low.values
+    pts = []
+    for j in range(N, n_closed - N):
+        is_h = high[j] >= high[j - N:j + N + 1].max()
+        is_l = low[j] <= low[j - N:j + N + 1].min()
+        if is_h and is_l:
+            continue                                         # one giant candle that is both: not a swing
+        if is_h:
+            pts.append([j, True, float(high[j])])
+        elif is_l:
+            pts.append([j, False, float(low[j])])
+    zz = []
+    for p in pts:                                            # two highs in a row -> keep the higher one (lows: the lower one)
+        if zz and zz[-1][1] == p[1]:
+            if (p[2] > zz[-1][2]) if p[1] else (p[2] < zz[-1][2]):
+                zz[-1] = p
+        else:
+            zz.append(p)
+    out, last = [], {True: None, False: None}
+    for j, hi, price in zz:
+        prev = last[hi]
+        if prev is None:
+            kind = "HH" if hi else "LL"                      # the first swing of a kind has nothing to compare with: skipped below
+            known = False
+        else:
+            kind = ("HH" if price > prev else "LH") if hi else ("HL" if price > prev else "LL")
+            known = True
+        last[hi] = price
+        if known:
+            out.append(dict(t=t[j], price=round(price, 2), kind=kind, hi=bool(hi)))
+    return out[-20:]
+
+
 def market_structure(df, n_closed, t, N):
     """Swing highs/lows (pivot with N candles each side) and breakouts of them on CLOSED candles.
     BOS = close breaks the last swing in the trend direction; CHoCH = break against the prior trend."""
@@ -629,7 +665,7 @@ def market_structure(df, n_closed, t, N):
             events.append(dict(kind="CHoCH" if trend == 1 else "BOS", up=False, t0=t[pl[0]], t1=t[i],
                                price=round(pl[1], 2), i0=pl[0], i1=i))
             trend, pl = -1, None
-    return dict(events=events[-14:], trend=trend, _all=events,
+    return dict(events=events[-14:], trend=trend, _all=events, swings=swing_points(df, n_closed, t, 3 if N >= 4 else 2),
                 high=dict(t=t[ph[0]], price=round(ph[1], 2)) if ph else None,
                 low=dict(t=t[pl[0]], price=round(pl[1], 2)) if pl else None)
 
@@ -2515,6 +2551,15 @@ function drawStructure(st){
       text: e.kind + (e.up ? ' up' : ' down')}]);
     structSeries.push(s);
   });
+  const sw = (st.swings || []).filter(x => x && x.t);
+  if (sw.length >= 2){                                                      // zig-zag through the swings + HH / HL / LH / LL labels
+    const z = chart.addLineSeries({color: 'rgba(144,164,174,.75)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+      crosshairMarkerVisible: false});
+    z.setData(sw.map(x => ({time: x.t, value: x.price})));
+    z.setMarkers(sw.map(x => ({time: x.t, position: x.hi ? 'aboveBar' : 'belowBar', shape: 'circle', size: 0.6,
+      color: (x.kind === 'HH' || x.kind === 'HL') ? '#26a69a' : '#ef5350', text: x.kind})));
+    structSeries.push(z);
+  }
   [[st.high, 'Swing H'], [st.low, 'Swing L']].forEach(a => {
     if (a[0]) structLines.push(candles.createPriceLine({price: a[0].price, color: '#78909c', lineWidth: 1,
       lineStyle: 2, axisLabelVisible: true, title: a[1]}));

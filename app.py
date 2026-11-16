@@ -4196,16 +4196,27 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             tfq = q.get("tf", ["15m"])[0]
             tfq = tfq if tfq in TFS and tfq not in ("4h",) else "15m"
-            out = [f"Raw Yahoo rows for {DEFAULT_SYM} {tfq} (IST). Look for the evening rows of 8-Nov (Muhurat)."]
-            for pp in ("false", "true"):
+            try:
+                nrow = max(5, min(int(q.get("n", ["14"])[0]), 70))
+            except ValueError:
+                nrow = 14
+            out = [f"Raw Yahoo rows for {DEFAULT_SYM} {tfq} (IST), last {nrow} rows. First block = the candles the app draws."]
+            try:
+                dfa = fetch(tfq, DEFAULT_SYM)
+                out.append(f"\n=== APP candles (after merging), last {nrow} ===")
+                for t, o, h, l, c in dfa[["time", "open", "high", "low", "close"]].tail(nrow).values:
+                    out.append(dt.datetime.fromtimestamp(int(t) + SHIFT, dt.timezone.utc).strftime("%d-%b %H:%M:%S") + f"  O {o:.2f}  H {h:.2f}  L {l:.2f}  C {c:.2f}")
+            except Exception as e:
+                out.append(f"\n=== APP candles: error {e}")
+            for pp in ("true", "false"):
                 try:
                     r = http.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{urlquote(DEFAULT_SYM, safe='')}",
                                  params={"interval": TFS[tfq][0], "range": "5d", "includePrePost": pp}, headers=HEADERS, timeout=8)
                     res = r.json()["chart"]["result"][0]
                     qq = res["indicators"]["quote"][0]
                     rows = [(t, o, h, l, c) for t, o, h, l, c in zip(res["timestamp"], qq["open"], qq["high"], qq["low"], qq["close"])]
-                    out.append(f"\n=== includePrePost={pp}: {len(rows)} rows, last 70 ===")
-                    for t, o, h, l, c in rows[-70:]:
+                    out.append(f"\n=== Yahoo includePrePost={pp}: {len(rows)} rows, last {nrow} ===")
+                    for t, o, h, l, c in rows[-nrow:]:
                         out.append(dt.datetime.fromtimestamp(t + SHIFT, dt.timezone.utc).strftime("%d-%b %H:%M:%S") + f"  O {o}  H {h}  L {l}  C {c}")
                 except Exception as e:
                     out.append(f"\n=== includePrePost={pp}: error {e}")

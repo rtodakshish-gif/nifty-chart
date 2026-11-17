@@ -2365,7 +2365,7 @@ PAGE = r"""<!doctype html><html lang="en" translate="no"><head><meta charset="ut
 <script>try { if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {})); } catch(e){}
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); window.__inst = e; try { const b = document.getElementById('inst_btn'); if (b) b.style.display = ''; } catch(x){} });</script>
 <div id="ochart" onclick="if(event.target===this)closeOch()"><div class="sheet">
-  <div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h4 id="ochtitle"></h4><button class="btn" onclick="closeOch()">Close</button></div>
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h4 id="ochtitle"></h4><span><button class="btn" id="ochfs" onclick="setOchFull(!$('ochart').classList.contains('full'))">Full screen</button> <button class="btn" onclick="closeOch()">Close</button></span></div>
   <div class="bar"><span id="ochside"></span><span class="sp"></span><span id="ochtf"></span></div>
   <div id="ochbox"></div>
   <div id="ochinfo"></div>
@@ -2495,6 +2495,10 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
 #ochart.on{display:flex}
 #ochart .sheet{background:var(--bg);color:var(--tx);width:100%;max-width:760px;border-radius:10px 10px 0 0;padding:10px 12px calc(12px + env(safe-area-inset-bottom));max-height:94vh;overflow:auto}
 #ochart h4{margin:0;font-size:15px;font-weight:500;color:var(--st)}
+#ochart.full{align-items:stretch}
+#ochart.full .sheet{max-width:none;border-radius:0;height:100vh;height:100dvh;max-height:100dvh;overflow:hidden;display:flex;flex-direction:column}
+#ochart.full #ochbox{flex:1;height:auto;min-height:0}
+#ochart.full #ochinfo{font-size:11.5px;line-height:1.45}
 #ochart .bar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:8px 0}
 #ochart .bar .sp{flex:1}
 #ochart #ochbox{height:300px;width:100%;position:relative}
@@ -3795,9 +3799,20 @@ function drawOpt(j){
 let och = null, ochChart = null, ochSeries = null, ochLine = null, ochBusy = false;
 function openOch(k, side){
   och = {sym: osym, exp: oexp, k: k, side: side, tf: ls('ochtf', '5m')};
-  $('ochart').classList.add('on'); loadOch(true);
+  $('ochart').classList.add('on'); setOchFull(ls('ochfull', '0') === '1'); loadOch(true);
 }
-function closeOch(){ $('ochart').classList.remove('on'); och = null; if (ochChart){ try { ochChart.remove(); } catch(e){} ochChart = ochSeries = ochLine = null; } }
+function setOchFull(on){
+  $('ochart').classList.toggle('full', on); $('ochfs').textContent = on ? 'Exit full' : 'Full screen'; ss('ochfull', on ? '1' : '0');
+  try {                                                  // also hide the browser bars where the phone allows it
+    const el = $('ochart');
+    if (on && el.requestFullscreen && !document.fullscreenElement) el.requestFullscreen().catch(() => {});
+    else if (!on && document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  } catch(e){}
+  if (ochChart) setTimeout(() => { try { ochChart.timeScale().fitContent(); } catch(e){} }, 200);
+}
+function closeOch(){
+  try { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); } catch(e){}
+  $('ochart').classList.remove('on'); och = null; if (ochChart){ try { ochChart.remove(); } catch(e){} ochChart = ochSeries = ochLine = null; } }
 function drawOchBar(){
   const mk = (id, arr, cur, fn) => { const a = $(id); a.innerHTML = ''; arr.forEach(x => { const b = document.createElement('button'); b.className = 'btn' + (x === cur ? ' on' : ''); b.textContent = x; b.style.marginRight = '4px'; b.onclick = () => fn(x); a.appendChild(b); }); };
   mk('ochside', ['CE', 'PE'], och.side, v => { och.side = v; loadOch(true); });
@@ -3818,7 +3833,8 @@ async function loadOch(reset){
     if (!ochChart){
       ochChart = LightweightCharts.createChart($('ochbox'), {autoSize: true, layout: {background: {color: t.bg}, textColor: t.tx}, grid: {vertLines: {color: t.grid}, horzLines: {color: t.grid}},
         timeScale: {timeVisible: true, secondsVisible: false, borderColor: t.bd}, rightPriceScale: {borderColor: t.bd}});
-      ochSeries = ochChart.addCandlestickSeries({upColor: '#4caf50', downColor: '#df514c', borderVisible: false, wickUpColor: '#4caf50', wickDownColor: '#df514c'});
+      ochSeries = ochChart.addCandlestickSeries({upColor: '#4caf50', downColor: '#df514c', borderVisible: false, wickUpColor: '#4caf50', wickDownColor: '#df514c',
+        autoscaleInfoProvider: orig => { const r = orig(); if (r && r.priceRange && r.priceRange.minValue < 0) r.priceRange.minValue = 0; return r; }});
       ochLine = ochChart.addLineSeries({color: '#8a8a8a', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false});
     }
     const hasReal = j.real && j.real.length >= 2;

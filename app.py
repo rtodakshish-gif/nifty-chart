@@ -743,14 +743,29 @@ def smc_zones(df, n_closed, t, N, atr, events):
 
 
 def liquidity_zones(df, n_closed, t, N, atr):
-    """LIVE liquidity. Levels = swing highs/lows (stop-losses sit there), found on CLOSED candles only.
-    EQH/EQL = two swings at (almost) the same level. Sweep = a candle pokes beyond a level but closes back
-    inside (stop-hunt); the running candle is checked too (live=True) so you see it as it happens."""
+    """LIVE liquidity. Levels = swing highs/lows (stop-losses sit there), found on CLOSED candles only, plus the previous day's
+    high / low (PDH / PDL) on intraday charts. EQH/EQL = two swings at (almost) the same level.
+    SWEEP (stop hunt) = a candle pokes beyond a level but closes back inside; the running candle is checked too (live=True).
+    Every sweep gets a status: pending (waiting), confirmed (within 5 candles a candle closes beyond the sweep candle's far end
+    = the hunt worked), failed (it closed beyond the level = a real breakout), or weak (nothing happened in 5 candles).
+    idea = the latest hunt with a trade plan: entry, stop behind the wick, target = the next untouched liquidity."""
     high, low, close = df.high.values, df.low.values, df.close.values
     n = len(df)
+    sec = int(np.median(np.diff(t[-50:]))) if n > 2 else 900
+    pd_at = {}                                         # first candle of a day -> (index of yesterday's high, index of yesterday's low)
+    if sec < 86400 and n > 2:
+        day = (df["time"].astype("int64").values + SHIFT) // 86400
+        prev = 0
+        for st in (np.flatnonzero(np.diff(day)) + 1):
+            pd_at[int(st)] = (prev + int(np.argmax(high[prev:st])), prev + int(np.argmin(low[prev:st])))
+            prev = int(st)
     levels, sweeps = [], []
     for i in range(N, n):
         live = i >= n_closed                           # the candle that is still forming
+        if i in pd_at:
+            jh, jl = pd_at[i]
+            levels.append(dict(side="H", j=jh, price=float(high[jh]), eq=False, done=False, kind="PDH"))
+            levels.append(dict(side="L", j=jl, price=float(low[jl]), eq=False, done=False, kind="PDL"))
         if not live:
             j = i - N
             if j >= N:
@@ -759,37 +774,80 @@ def liquidity_zones(df, n_closed, t, N, atr):
                                       ("L", low, low[j] <= low[j - N:j + N + 1].min())):
                     if not ok:
                         continue
-                    lv = dict(side=side, j=j, price=float(arr[j]), eq=False, done=False)
+                    lv = dict(side=side, j=j, price=float(arr[j]), eq=False, done=False, kind="")
                     for o in levels:                   # equal high / equal low with an earlier untouched swing
                         if o["side"] == side and not o["done"] and abs(o["price"] - lv["price"]) <= tol:
                             o["eq"] = lv["eq"] = True
                     levels.append(lv)
-                levels = levels[-80:]
+                levels = levels[-200:]
         for lv in levels:
             if lv["done"]:
                 continue
-            if lv["side"] == "H" and high[i] > lv["price"]:
+            hi_side = lv["side"] == "H"
+            if hi_side and high[i] > lv["price"]:
                 lv["done"] = True
                 if close[i] < lv["price"]:
-                    sweeps.append(dict(up=False, eq=lv["eq"], live=live, t0=t[lv["j"]], t1=t[i],
-                                       price=round(lv["price"], 2)))
-            elif lv["side"] == "L" and low[i] < lv["price"]:
+                    sweeps.append(dict(up=False, eq=lv["eq"], live=live, t0=t[lv["j"]], t1=t[i], price=round(lv["price"], 2), i=i,
+                                       name=lv["kind"] or ("EQH" if lv["eq"] else "BSL"), depth=round(float(high[i]) - lv["price"], 2)))
+            elif (not hi_side) and low[i] < lv["price"]:
                 lv["done"] = True
                 if close[i] > lv["price"]:
-                    sweeps.append(dict(up=True, eq=lv["eq"], live=live, t0=t[lv["j"]], t1=t[i],
-                                       price=round(lv["price"], 2)))
-    # levels that are still waiting to be hit: nearest 2 above, nearest 2 below, and every EQH/EQL close by
+                    sweeps.append(dict(up=True, eq=lv["eq"], live=live, t0=t[lv["j"]], t1=t[i], price=round(lv["price"], 2), i=i,
+                                       name=lv["kind"] or ("EQL" if lv["eq"] else "SSL"), depth=round(lv["price"] - float(low[i]), 2)))
+    best = {}                                          # one candle can sweep several levels at once: keep the most important one
+    for e in sweeps:
+        k, pr = (e["i"], e["up"]), (2 if e["name"] in ("PDH", "PDL") else 1 if e["eq"] else 0)
+        if k not in best or (pr, e["depth"]) > (best[k][0], best[k][1]["depth"]):
+            best[k] = (pr, e)
+    sweeps = sorted([v[1] for v in best.values()], key=lambda e: e["i"])
+    for e in sweeps:                                   # did the hunt work?
+        i, up = e["i"], e["up"]
+        e["status"] = "live" if e["live"] else "pending"
+        if not e["live"]:
+            for k in range(i + 1, min(i + 6, n_closed)):
+                if (close[k] > high[i]) if not up else (close[k] < low[i]):      # closed back THROUGH the level: real breakout
+                    e["status"] = "failed"
+                    break
+                if (close[k] < low[i]) if not up else (close[k] > high[i]):      # closed beyond the sweep candle's far end: hunt confirmed
+                    e["status"] = "confirmed"
+                    break
+            else:
+                if n_closed - 1 >= i + 5:
+                    e["status"] = "weak"
+        rng = max(float(high[i] - low[i]), 1e-9)
+        o_i, c_i = float(df.open.values[i]), float(close[i])
+        wick = ((min(o_i, c_i) - float(low[i])) if up else (float(high[i]) - max(o_i, c_i))) / rng        # share of the candle that is the rejection wick
+        e["strength"] = 1 + (1 if (e["eq"] or e["name"] in ("PDH", "PDL")) else 0) + (1 if wick >= 0.5 else 0) + (1 if e["status"] == "confirmed" else 0)
+        e["strength"] = min(e["strength"], 3)
     price, lim = float(close[-1]), 12 * float(atr[-1])
+    # trade idea from the latest sweep that is confirmed (or fresh): entry, stop behind the wick, target = next untouched liquidity
+    idea = None
+    for e in reversed(sweeps):
+        if e["status"] not in ("confirmed", "live", "pending") or n - 1 - e["i"] > 12:
+            continue
+        i, up, a = e["i"], e["up"], float(atr[min(e["i"], n - 1)])
+        entry = float(high[i]) if up else float(low[i])                            # break of the sweep candle = the entry trigger
+        sl = (float(low[i]) - 0.1 * a) if up else (float(high[i]) + 0.1 * a)
+        risk = abs(entry - sl)
+        opp = [lv["price"] for lv in levels if not lv["done"] and (lv["side"] == "H" if up else lv["side"] == "L")
+               and ((lv["price"] > entry + risk) if up else (lv["price"] < entry - risk))]
+        tp = (min(opp) if up else max(opp)) if opp else (entry + 2 * risk if up else entry - 2 * risk)
+        idea = dict(side="BUY" if up else "SELL", status=e["status"], name=e["name"], level=e["price"], entry=round(entry, 2), sl=round(sl, 2),
+                    tp=round(tp, 2), rr=round(abs(tp - entry) / risk, 1) if risk else None, t1=e["t1"], live=e["live"])
+        break
+    # levels that are still waiting to be hit: nearest 2 above, nearest 2 below, every EQH/EQL and PDH/PDL close by
     open_lv = [lv for lv in levels if not lv["done"] and abs(lv["price"] - price) <= lim]
     above = sorted([lv for lv in open_lv if lv["side"] == "H" and lv["price"] > price], key=lambda x: x["price"])[:2]
     below = sorted([lv for lv in open_lv if lv["side"] == "L" and lv["price"] < price], key=lambda x: -x["price"])[:2]
     chosen, seen = [], set()
-    for lv in above + below + [x for x in open_lv if x["eq"]]:
+    for lv in above + below + [x for x in open_lv if x["eq"] or x["kind"]]:
         k = (lv["side"], round(lv["price"], 1))
         if k not in seen:
             seen.add(k)
-            chosen.append(dict(side=lv["side"], eq=lv["eq"], price=round(lv["price"], 2), t0=t[lv["j"]]))
-    return dict(sweeps=sweeps[-12:], levels=chosen[:8], end=t[n - 1])
+            chosen.append(dict(side=lv["side"], eq=lv["eq"], kind=lv["kind"], price=round(lv["price"], 2), t0=t[lv["j"]]))
+    for e in sweeps:
+        e.pop("i", None)
+    return dict(sweeps=sweeps[-12:], levels=chosen[:10], end=t[n - 1], idea=idea)
 
 
 def sr_levels(df, n_closed, N, atr, n_live=None):
@@ -2326,6 +2384,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     </div>
     <div id="stat"><span id="st"></span><span id="ema"></span><span id="lastsig"></span><span id="lastema"></span></div>
     <div id="bias"></div>
+    <div id="hunt"></div>
     <div id="chart"></div>
     <div id="foot"><span id="sum"></span> <span id="upd"></span></div>
   </section>
@@ -2603,22 +2662,38 @@ function drawLiquidity(lq){
   const key = showLiq ? (sym + tf + JSON.stringify(lq)) : 'off';
   if (key === liqKey) return;
   clearLiquidity(); liqKey = key;
+  const hb = $('hunt'); if (hb) hb.innerHTML = '';
   if (!showLiq || !lq) return;
   lq.levels.forEach(l => {
-    const name = l.eq ? (l.side === 'H' ? 'EQH' : 'EQL') : (l.side === 'H' ? 'BSL' : 'SSL');
-    liqLines.push(candles.createPriceLine({price: l.price, color: l.eq ? '#ffa726' : '#90a4ae', lineWidth: 1,
+    const name = l.kind ? l.kind : (l.eq ? (l.side === 'H' ? 'EQH' : 'EQL') : (l.side === 'H' ? 'BSL' : 'SSL'));
+    liqLines.push(candles.createPriceLine({price: l.price, color: l.kind ? '#7e57c2' : (l.eq ? '#ffa726' : '#90a4ae'), lineWidth: 1,
       lineStyle: 3, axisLabelVisible: true, title: name}));
   });
+  const stTxt = {confirmed: ' OK', failed: ' failed', pending: ' ?', live: '', weak: ''};
   lq.sweeps.forEach(e => {
     if (!(e.t1 > e.t0)) return;
-    const col = e.live ? '#fbc02d' : '#26c6da';
+    const col = e.status === 'confirmed' ? (e.up ? '#26a69a' : '#ef5350') : e.status === 'failed' ? '#9e9e9e' : e.status === 'weak' ? '#90a4ae' : '#fbc02d';
     const s = chart.addLineSeries({color: col, lineWidth: 1, lineStyle: 1, priceLineVisible: false,
       lastValueVisible: false, crosshairMarkerVisible: false});
     s.setData([{time: e.t0, value: e.price}, {time: e.t1, value: e.price}]);
-    s.setMarkers([{time: e.t1, position: e.up ? 'belowBar' : 'aboveBar', color: col, shape: 'square',
-      text: (e.live ? 'LIVE ' : '') + (e.eq ? 'EQ ' : '') + 'Sweep ' + (e.up ? 'low' : 'high')}]);
+    s.setMarkers([{time: e.t1, position: e.up ? 'belowBar' : 'aboveBar', color: col,
+      shape: e.status === 'confirmed' ? (e.up ? 'arrowUp' : 'arrowDown') : 'square',
+      text: (e.live ? 'LIVE ' : '') + (e.name || 'Sweep') + ' sweep' + (stTxt[e.status] || '') + (e.strength >= 3 ? ' ***' : e.strength === 2 ? ' **' : '')}]);
     liqSeries.push(s);
   });
+  const d = lq.idea;
+  if (d){
+    const buy = d.side === 'BUY', wait = d.status !== 'confirmed';
+    [[d.entry, '#1e88e5', 'Hunt ' + d.side + (wait ? ' (wait)' : '') + ' entry'], [d.sl, '#ef5350', 'Hunt SL'], [d.tp, '#26a69a', 'Hunt TP']].forEach(a => {
+      liqLines.push(candles.createPriceLine({price: a[0], color: a[1], lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: a[2]}));
+    });
+    let warn = '';
+    try { if (typeof biasOk === 'function' && !biasOk(d.side)) warn = ' <span style="color:#f9a825">| against the 1H + 4H trend filter</span>'; } catch(x){}
+    if (hb) hb.innerHTML = '<div style="font-size:12.5px;padding:2px 12px 4px;line-height:1.5"><b style="color:' + (buy ? '#26a69a' : '#ef5350') + '">Liquidity hunt ' + d.side + '</b> '
+      + '<span class="mu">' + d.name + ' ' + (buy ? 'low' : 'high') + ' swept at ' + fmt(d.level) + ' - '
+      + (d.status === 'confirmed' ? 'confirmed, price is moving away' : d.status === 'live' ? 'happening now, wait for the candle to close' : 'waiting: needs a close ' + (buy ? 'above ' : 'below ') + fmt(d.entry)) + '</span>'
+      + '<br>Entry ' + fmt(d.entry) + ' | SL ' + fmt(d.sl) + ' | Target ' + fmt(d.tp) + (d.rr ? ' | RR ' + d.rr : '') + warn + '</div>';
+  }
 }
 /* ---------- support (green) / resistance (red) ---------- */
 let srLines = [], srSeries = [], srKey = '', lastSR = null, showSR = ls('sr', '1') !== '0';

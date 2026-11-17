@@ -1388,7 +1388,133 @@ def oc_view(sym, exp=""):
                  expiries=out["expiries"], stamp=out["stamp"], time=now_ist.strftime("%d-%b %H:%M:%S IST"),
                  rows=shown, summary=S, reco=reco, lot=LOT, sell_prem=SELL_PREMIUM, trend=(bias or {}).get("label"), trend_ok=bias is not None)
         oc_cache[key] = {"j": j, "t": time.time()}
+        if out["src"] == "NSE":
+            try:
+                opt_record(sym, out["expiry"], shown, time.time())
+            except Exception as e:
+                print("option tick note:", e)
         return j
+
+
+# ---------- per-strike option chart ----------
+OPT_TFS = {"1m": 60, "5m": 300, "15m": 900}
+OPT_KEEP = {"1m": 420, "5m": 300, "15m": 200}           # how many model candles are drawn
+opt_ticks = {}                                          # (sym, expiry, strike, "CE"/"PE") -> [(unix time, last price), ...]  recorded while the app polls the chain
+opt_tlock = threading.Lock()
+oc_seen = {}                                            # (sym, expiry requested) -> last time somebody opened the Options tab
+
+
+def opt_record(sym, exp, rows, ts):
+    with opt_tlock:
+        for r in rows:
+            for side, leg in (("CE", r.get("ce")), ("PE", r.get("pe"))):
+                try:
+                    v = float(leg["ltp"]) if leg and leg.get("ltp") is not None else 0.0
+                except (TypeError, ValueError):
+                    v = 0.0
+                if v <= 0:
+                    continue
+                lst = opt_ticks.setdefault((sym, exp, float(r["strike"]), side), [])
+                if lst and lst[-1][1] == v and ts - lst[-1][0] < 60:
+                    continue
+                lst.append((ts, v))
+                if len(lst) > 3000:
+                    del lst[:600]
+
+
+def opt_real_candles(sym, exp, strike, side, sec):
+    out, cur = [], None
+    for ts, v in list(opt_ticks.get((sym, exp, float(strike), side), [])):
+        b = int(ts // sec * sec)
+        if cur is None or cur["b"] != b:
+            if cur:
+                out.append(cur)
+            cur = dict(b=b, open=v, high=v, low=v, close=v)
+        else:
+            cur["high"] = max(cur["high"], v)
+            cur["low"] = min(cur["low"], v)
+            cur["close"] = v
+    if cur:
+        out.append(cur)
+    return [dict(time=c["b"] + SHIFT, open=c["open"], high=c["high"], low=c["low"], close=c["close"]) for c in out]
+
+
+def opt_iv_fit(S, K, T, call, ltp, leg_iv):
+    """Implied volatility that makes Black-Scholes match the real price; else the NSE IV, else India VIX."""
+    intrinsic = max(0.0, (S - K) if call else (K - S))
+    if ltp and ltp > intrinsic + 0.3:
+        lo, hi = 0.02, 3.0
+        if bs_price(S, K, T, lo, call) <= ltp <= bs_price(S, K, T, hi, call):
+            for _ in range(50):
+                mid = (lo + hi) / 2
+                if bs_price(S, K, T, mid, call) < ltp:
+                    lo = mid
+                else:
+                    hi = mid
+            if 0.05 <= (lo + hi) / 2 <= 0.8:                  # a wild fit (last minutes before expiry, thin price) is not trusted
+                return (lo + hi) / 2, "fit to LTP"
+    try:
+        if leg_iv and float(leg_iv) > 1:
+            return float(leg_iv) / 100.0, "NSE IV"
+    except (TypeError, ValueError):
+        pass
+    return get_iv(), "India VIX"
+
+
+def opt_model_candles(sym, exp, strike, side, tf, spot, ltp, leg_iv):
+    """Estimated option candles: Black-Scholes on the Nifty candles. A call moves with the index, a put against it, so the open / high / low / close map one to one."""
+    sec = OPT_TFS[tf]
+    call = side == "CE"
+    df = fetch(tf, OC_SYMS[sym][0])
+    exp_ep = int(pd.Timestamp(_oc_date(exp) + dt.timedelta(hours=15, minutes=30)).timestamp()) - SHIFT
+    now = time.time()
+    T_now = max((exp_ep - now) / (365 * 86400), 1 / (365 * 24 * 60))
+    iv, ivsrc = opt_iv_fit(float(spot), float(strike), T_now, call, ltp, leg_iv)
+    df = df[df["time"] < exp_ep].tail(OPT_KEEP[tf])
+    out = []
+    for t, o, h, l, c in zip(df["time"], df["open"], df["high"], df["low"], df["close"]):
+        T = max((exp_ep - (int(t) + sec / 2)) / (365 * 86400), 1 / (365 * 24 * 60))
+        f = lambda x: bs_price(float(x), float(strike), T, iv, call)
+        po, pc = f(o), f(c)
+        ph, pl = (f(h), f(l)) if call else (f(l), f(h))
+        out.append(dict(time=int(t) + SHIFT, open=round(po, 2), high=round(max(ph, po, pc), 2), low=round(min(pl, po, pc), 2), close=round(pc, 2)))
+    return out, iv, ivsrc
+
+
+def opt_chart(sym, exp, strike, side, tf):
+    sym = sym if sym in OC_SYMS else "NIFTY"
+    side = "PE" if str(side).upper() == "PE" else "CE"
+    tf = tf if tf in OPT_TFS else "5m"
+    j = oc_view(sym, exp)
+    row = next((r for r in j["rows"] if abs(r["strike"] - float(strike)) < 0.01), None)
+    if row is None:
+        raise ValueError("strike not in the chain")
+    leg = row["ce" if side == "CE" else "pe"] or {}
+    real_src = j["src"] == "NSE"
+    ltp = None
+    try:
+        ltp = float(leg.get("ltp")) if leg.get("ltp") is not None else None
+    except (TypeError, ValueError):
+        ltp = None
+    model, iv, ivsrc = opt_model_candles(sym, j["expiry"], row["strike"], side, tf, j["spot"], ltp if real_src else None, leg.get("iv"))
+    real = opt_real_candles(sym, j["expiry"], row["strike"], side, OPT_TFS[tf]) if real_src else []
+    return dict(sym=sym, name=j["name"], expiry=j["expiry"], strike=row["strike"], side=side, tf=tf, spot=j["spot"], ltp=ltp,
+                chg=leg.get("chg"), oi=leg.get("oi"), oichg=leg.get("oichg"), nse=real_src, iv=round(iv * 100, 1), ivsrc=ivsrc,
+                model=model, real=real, time=j["time"])
+
+
+def oc_recorder():
+    """While the Options tab was opened in the last 3 hours, keeps reading the chain so real option prices are recorded for the chart."""
+    while True:
+        time.sleep(15)
+        try:
+            if market_status() != "OPEN":
+                continue
+            for (sym, exp), t in list(oc_seen.items()):
+                if time.time() - t < 3 * 3600:
+                    oc_view(sym, exp)
+        except Exception as e:
+            print("recorder note:", e)
 
 
 def fib_view(tf, sym):
@@ -2238,6 +2364,12 @@ PAGE = r"""<!doctype html><html lang="en" translate="no"><head><meta charset="ut
 <link rel="apple-touch-icon" href="/icon-192.png">
 <script>try { if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {})); } catch(e){}
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); window.__inst = e; try { const b = document.getElementById('inst_btn'); if (b) b.style.display = ''; } catch(x){} });</script>
+<div id="ochart" onclick="if(event.target===this)closeOch()"><div class="sheet">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><h4 id="ochtitle"></h4><button class="btn" onclick="closeOch()">Close</button></div>
+  <div class="bar"><span id="ochside"></span><span class="sp"></span><span id="ochtf"></span></div>
+  <div id="ochbox"></div>
+  <div id="ochinfo"></div>
+</div></div>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
 :root{--bg:#fff;--bg2:#fafafa;--tx:#444;--st:#424242;--mu:#9b9b9b;--bd:#eee;--bl:#387ed1;--up:#4caf50;--dn:#df514c;--or:#ff5722;--chip:#f5f5f5}
@@ -2357,6 +2489,17 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
 #obox .rc .kv{display:grid;grid-template-columns:1fr 1fr;gap:3px 10px;margin:5px 0}
 #obox .rc .kv span{color:var(--mu)}#obox .rc .kv b{font-weight:500;color:var(--st)}
 #obox .rt{font-size:9px;font-weight:600;margin-left:3px;padding:0 3px;border-radius:2px;color:#fff;vertical-align:1px}
+#obox td[data-s]{cursor:pointer}
+#obox td[data-s]:active{background:var(--chip)!important}
+#ochart{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:60;display:none;align-items:flex-end;justify-content:center}
+#ochart.on{display:flex}
+#ochart .sheet{background:var(--bg);color:var(--tx);width:100%;max-width:760px;border-radius:10px 10px 0 0;padding:10px 12px calc(12px + env(safe-area-inset-bottom));max-height:94vh;overflow:auto}
+#ochart h4{margin:0;font-size:15px;font-weight:500;color:var(--st)}
+#ochart .bar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:8px 0}
+#ochart .bar .sp{flex:1}
+#ochart #ochbox{height:300px;width:100%;position:relative}
+#ochart #ochinfo{font-size:12px;color:var(--mu);margin-top:6px;line-height:1.6}
+#ochart #ochinfo b{color:var(--st);font-weight:500}
 #obox .warn{border:1px solid var(--or);border-radius:3px;padding:6px 8px;margin:6px 0;font-size:12px;color:var(--st)}
 </style></head><body>
 <div id="app">
@@ -2470,6 +2613,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div class="scrollx" id="oexp" style="padding-left:0"></div>
     <div id="obox" class="jbox" style="margin-top:6px"><span class="mu">loading...</span></div>
     <div class="how">
+      <p><b>Tap any row</b> (CALL side = CE chart, PUT side = PE chart) to open the price chart of that strike.</p>
       <p><b>How it works:</b> the table shows the strikes around the ATM (orange) with the CALL side on the left and the PUT side on the right. <b>OI</b> = open interest (contracts), <b>chg</b> = change in OI today, the shaded bar behind OI = how big it is compared with the other strikes. Shaded cells are in-the-money.</p>
       <p><b>PCR</b> = total PUT OI / total CALL OI (above 1 = more puts written, often read as supportive; below 0.7 = more calls, often read as heavy). <b>Max pain</b> = the strike where option writers lose the least at expiry. <b>Resistance</b> = strike with the most CALL OI, <b>Support</b> = strike with the most PUT OI. These are only reference levels, not signals.</p>
       <p>Data is the free NSE option chain, refreshed every 15 s. If NSE does not answer (it often blocks cloud servers) the table switches to a clearly marked <b>ESTIMATE</b> (Black-Scholes with India VIX, no OI) so you can still see approximate premiums.</p>
@@ -3636,18 +3780,65 @@ function drawOpt(j){
     const c = r.ce || {}, p = r.pe || {}, atm = r.strike === j.atm;
     const ceItm = r.strike < j.spot, peItm = r.strike > j.spot;
     h += '<tr' + (atm ? ' class="atm"' : '') + '>'
-      + '<td style="' + bar(0, '', 'left', ceItm) + '">' + oChg(c.oichg) + '</td>'
-      + '<td style="' + bar(c.oi, 'rgba(223,81,76,.28)', 'left', ceItm) + '">' + oiF(c.oi) + '</td>'
-      + '<td style="' + bar(0, '', 'left', ceItm) + '">' + oPx(c.ltp) + '</td>'
-      + '<td class="k">' + Math.round(r.strike).toLocaleString('en-IN') + (tag[r.strike] ? '<i class="rt" style="background:' + tag[r.strike][1] + '">' + tag[r.strike][0] + '</i>' : '') + '</td>'
-      + '<td style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oPx(p.ltp) + '</td>'
-      + '<td style="text-align:left;' + bar(p.oi, 'rgba(76,175,80,.28)', 'right', peItm) + '">' + oiF(p.oi) + '</td>'
-      + '<td style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oChg(p.oichg) + '</td></tr>';
+      + '<td data-k="' + r.strike + '" data-s="CE" style="' + bar(0, '', 'left', ceItm) + '">' + oChg(c.oichg) + '</td>'
+      + '<td data-k="' + r.strike + '" data-s="CE" style="' + bar(c.oi, 'rgba(223,81,76,.28)', 'left', ceItm) + '">' + oiF(c.oi) + '</td>'
+      + '<td data-k="' + r.strike + '" data-s="CE" style="' + bar(0, '', 'left', ceItm) + '">' + oPx(c.ltp) + '</td>'
+      + '<td class="k" data-k="' + r.strike + '" data-s="CE">' + Math.round(r.strike).toLocaleString('en-IN') + (tag[r.strike] ? '<i class="rt" style="background:' + tag[r.strike][1] + '">' + tag[r.strike][0] + '</i>' : '') + '</td>'
+      + '<td data-k="' + r.strike + '" data-s="PE" style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oPx(p.ltp) + '</td>'
+      + '<td data-k="' + r.strike + '" data-s="PE" style="text-align:left;' + bar(p.oi, 'rgba(76,175,80,.28)', 'right', peItm) + '">' + oiF(p.oi) + '</td>'
+      + '<td data-k="' + r.strike + '" data-s="PE" style="text-align:left;' + bar(0, '', 'right', peItm) + '">' + oChg(p.oichg) + '</td></tr>';
   });
   $('obox').innerHTML = h + '</table>';
   const ak = osym + '|' + j.expiry;
   if (oScrolled !== ak){ oScrolled = ak; const ar = document.querySelector('#obox tr.atm'); if (ar) setTimeout(() => ar.scrollIntoView({block: 'center'}), 50); }     // first time: bring the ATM row to the middle
 }
+let och = null, ochChart = null, ochSeries = null, ochLine = null, ochBusy = false;
+function openOch(k, side){
+  och = {sym: osym, exp: oexp, k: k, side: side, tf: ls('ochtf', '5m')};
+  $('ochart').classList.add('on'); loadOch(true);
+}
+function closeOch(){ $('ochart').classList.remove('on'); och = null; if (ochChart){ try { ochChart.remove(); } catch(e){} ochChart = ochSeries = ochLine = null; } }
+function drawOchBar(){
+  const mk = (id, arr, cur, fn) => { const a = $(id); a.innerHTML = ''; arr.forEach(x => { const b = document.createElement('button'); b.className = 'btn' + (x === cur ? ' on' : ''); b.textContent = x; b.style.marginRight = '4px'; b.onclick = () => fn(x); a.appendChild(b); }); };
+  mk('ochside', ['CE', 'PE'], och.side, v => { och.side = v; loadOch(true); });
+  mk('ochtf', ['1m', '5m', '15m'], och.tf, v => { och.tf = v; ss('ochtf', v); loadOch(true); });
+}
+async function loadOch(reset){
+  if (!och || (ochBusy && !reset)) return;
+  const me = och, want = JSON.stringify([me.sym, me.exp, me.k, me.side, me.tf]);
+  ochBusy = true; drawOchBar();
+  if (reset) $('ochinfo').innerHTML = '<span class="mu">loading...</span>';
+  try{
+    const r = await fetch('/optchart?sym=' + me.sym + '&exp=' + encodeURIComponent(me.exp) + '&strike=' + me.k + '&side=' + me.side + '&tf=' + me.tf + '&_=' + Date.now());
+    const j = await r.json();
+    if (!och || want !== JSON.stringify([och.sym, och.exp, och.k, och.side, och.tf])) return;
+    if (j.error){ $('ochinfo').innerHTML = '<span class="mu">Could not load (' + j.error + ').</span>'; return; }
+    $('ochtitle').textContent = j.name + ' ' + j.expiry.replace(/-(\d{4})$/, '') + ' ' + Math.round(j.strike).toLocaleString('en-IN') + ' ' + j.side;
+    const t = dark ? TH.dark : TH.light;
+    if (!ochChart){
+      ochChart = LightweightCharts.createChart($('ochbox'), {autoSize: true, layout: {background: {color: t.bg}, textColor: t.tx}, grid: {vertLines: {color: t.grid}, horzLines: {color: t.grid}},
+        timeScale: {timeVisible: true, secondsVisible: false, borderColor: t.bd}, rightPriceScale: {borderColor: t.bd}});
+      ochSeries = ochChart.addCandlestickSeries({upColor: '#4caf50', downColor: '#df514c', borderVisible: false, wickUpColor: '#4caf50', wickDownColor: '#df514c'});
+      ochLine = ochChart.addLineSeries({color: '#8a8a8a', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false});
+    }
+    const hasReal = j.real && j.real.length >= 2;
+    if (hasReal){ ochSeries.setData(j.real); ochLine.setData(j.model.map(c => ({time: c.time, value: c.close}))); }
+    else { ochSeries.setData(j.model); ochLine.setData([]); }
+    if (reset) ochChart.timeScale().fitContent();
+    const px = v => v == null ? '-' : Number(v).toFixed(2);
+    $('ochinfo').innerHTML = 'LTP <b>' + px(j.ltp) + '</b>' + (j.chg != null ? ' (' + (j.chg > 0 ? '+' : '') + Number(j.chg).toFixed(2) + ')' : '') + ' | OI <b>' + oiF(j.oi) + '</b> ' + oChg(j.oichg) + ' | Nifty ' + fmt(j.spot) + '<br>'
+      + (hasReal
+        ? '<b style="color:var(--up)">REAL</b> candles = prices recorded by this app since it started watching (' + j.real.length + ' candles). The grey dotted line is the <b>estimate</b> before that (Black-Scholes, IV ' + j.iv + '% - ' + j.ivsrc + ').'
+        : (j.nse ? '<b style="color:var(--or)">ESTIMATED</b> chart - Black-Scholes on the Nifty candles, IV ' + j.iv + '% (' + j.ivsrc + '). Real recorded candles start appearing here while the market is open and this tab is used.'
+                 : '<b style="color:var(--or)">ESTIMATED</b> chart (NSE not answering) - Black-Scholes, IV ' + j.iv + '% (' + j.ivsrc + '). Not real prices.'))
+      + '<br>Updated ' + j.time;
+  } catch(e){ if (reset) $('ochinfo').innerHTML = '<span class="mu">Could not load, trying again...</span>'; }
+  finally { ochBusy = false; }
+}
+$('obox').addEventListener('click', e => {
+  const td = e.target.closest('td[data-s]'); if (td) openOch(td.getAttribute('data-k'), td.getAttribute('data-s'));
+});
+setInterval(() => { if (och && !document.hidden) loadOch(false); }, 5000);
 async function loadOpt(){
   if (oBusy) return;
   oBusy = true;
@@ -4395,7 +4586,16 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/options":
             q = parse_qs(u.query)
             try:
+                oc_seen[(q.get("sym", ["NIFTY"])[0].upper(), q.get("exp", [""])[0])] = time.time()
                 j = oc_view(q.get("sym", ["NIFTY"])[0].upper(), q.get("exp", [""])[0])
+            except Exception as e:
+                j = {"error": str(e)[:200]}
+            self._send(200, "application/json", json.dumps(j).encode("utf-8"))
+        elif u.path == "/optchart":
+            q = parse_qs(u.query)
+            try:
+                j = opt_chart(q.get("sym", ["NIFTY"])[0].upper(), q.get("exp", [""])[0], float(q.get("strike", ["0"])[0]),
+                              q.get("side", ["CE"])[0], q.get("tf", ["5m"])[0])
             except Exception as e:
                 j = {"error": str(e)[:200]}
             self._send(200, "application/json", json.dumps(j).encode("utf-8"))
@@ -4481,6 +4681,7 @@ if __name__ == "__main__":
     journal_load()
     threading.Thread(target=news_loop, daemon=True).start()
     threading.Thread(target=journal_loop, daemon=True).start()
+    threading.Thread(target=oc_recorder, daemon=True).start()
     print("Signal journal ON (file: %s)" % JOURNAL_FILE)
     print("Phone alerts ON for " + ", ".join(ALERT_TFS) if alerts_enabled() else "Phone alerts OFF (set NTFY_TOPIC or Telegram to turn on)")
     if not CLOUD:

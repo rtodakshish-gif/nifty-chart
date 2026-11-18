@@ -2284,6 +2284,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font-family:
 #biasbox table{width:100%;border-collapse:collapse;margin-top:4px}
 #biasbox td,#biasbox th{padding:2px 4px;text-align:left;font-weight:400;border-top:1px solid var(--bd)}
 #stat{padding:0 12px 4px;font-size:12px;color:var(--mu);display:flex;gap:12px;flex-wrap:wrap}
+#stat #ema{color:#8e5fb5}
 #chart{flex:1;min-height:180px}
 #foot{padding:4px 12px 6px;font-size:11px;color:var(--mu)}
 /* signals / plan */
@@ -2540,7 +2541,7 @@ const opt = (c, w) => ({color:c, lineWidth:w, priceLineVisible:false, lastValueV
 const stLine = chart.addLineSeries(opt('#00c853', 2));      // ONE Supertrend line, each point coloured green / red (two separate series were joined by a long diagonal across the other colour's period)
 const ST_UP = '#00c853', ST_DN = '#ff1744';
 function stMerge(up, dn){ return up.map((p, i) => (p.value != null) ? {time: p.time, value: p.value, color: ST_UP} : {time: p.time, value: dn[i].value, color: ST_DN}); }
-const ema  = chart.addLineSeries(opt('#2196f3', 1));
+const ema  = chart.addLineSeries(opt('#8e5fb5', 1));
 let first = true, lastT = 0, lastN = 0, rangeDirty = false;
 
 function applyTheme(){

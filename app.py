@@ -566,43 +566,6 @@ def simulate(df, d, intraday):
     return trades
 
 
-def simulate_ema(df, d, intraday):
-    """EMA BUY trades: enter at the close of the EMA BUY candle; exit when Supertrend turns red, at the stop-loss
-    (same rule as the flip trades, fixed at entry) or (intraday) at the end of the day. Buy side only."""
-    close, low, opn = df.close.values, df.low.values, df.open.values
-    tr = pd.concat([df.high - df.low, (df.high - df.close.shift()).abs(),
-                    (df.low - df.close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14, min_periods=1).mean().values
-    day = ((df.time.values + SHIFT) // 86400)
-    n = len(df)
-    trades, busy = [], -1
-    for sg in find_ema_buys(df, d, n):
-        i = sg["i"]
-        if i <= busy:
-            continue
-        entry = close[i]
-        risk = SL_ATR_MULT * atr[i] if SL_ATR_MULT else entry * SL_PCT / 100
-        sl = entry - risk
-        j, exit_px, why = i + 1, None, None
-        while j < n:
-            if intraday and day[j] != day[i]:
-                exit_px, why, j = close[j - 1], "EOD", j - 1
-                break
-            if low[j] <= sl:
-                exit_px, why = min(sl, opn[j]), "SL"
-                break
-            if d[j] == -1:
-                exit_px, why = close[j], "FLIP"
-                break
-            j += 1
-        if exit_px is None:
-            trades.append(dict(side=1, i=i, entry=entry, j=None, exit=close[-1], why="OPEN", sl=sl))
-            break
-        trades.append(dict(side=1, i=i, entry=entry, j=j, exit=exit_px, why=why, sl=sl))
-        busy = j
-    return trades
-
-
 def market_status():
     ist = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SHIFT)
     open_now = (ist.weekday() < 5 and ist.date().isoformat() not in NSE_HOLIDAYS      # NSE holiday (e.g. Diwali Balipratipada 10-Nov) = closed
@@ -1034,25 +997,6 @@ def find_flips(df, d, n_closed, sec):
             c, e = float(df.close[i]), float(df.ema[i])
             out.append(dict(i=i, buy=buy, ok=(c > e) if buy else (c < e), price=round(c, 2),
                             time=fmt_sig_time(int(df.time[i]), sec)))
-    return out
-
-
-EMA_TOUCH_TOL = 0.0005                   # a wick within 0.05% of the EMA20 counts as "touching" it
-
-
-def find_ema_buys(df, d, n_closed):
-    """EMA BUY signal (closed candles only): Supertrend is green, the candle dips down to the EMA20 (low <= EMA20) and
-    closes back ABOVE it. The candle may be green, or red with the close in the upper half of its range (a hammer: the
-    wick went to the EMA and buyers pushed it back up). Several in a row = only the first one.
-    The candle on which Supertrend itself flips to green is skipped (that candle already has its normal BUY arrow)."""
-    out, prev = [], False
-    for i in range(1, n_closed):
-        o, h, l, c, e = float(df.open[i]), float(df.high[i]), float(df.low[i]), float(df.close[i]), float(df.ema[i])
-        bounce = c > o or c >= (h + l) / 2                       # green candle, or a red one that closed in the upper half
-        hit = bool(d[i] == 1 and d[i - 1] == 1 and bounce and c > e and l <= e * (1 + EMA_TOUCH_TOL))
-        if hit and not prev:
-            out.append(dict(i=i, price=round(c, 2)))
-        prev = hit
     return out
 
 
@@ -1762,20 +1706,6 @@ def make_plan(tf=PLAN_TF):
             out["bias"], out["active"] = bias, bool(okt)
             if okt:
                 out["plan"] = option_plan(spot, call=not f["buy"])     # SELL signal -> sell CE ; BUY signal -> sell PE
-    out["ema"] = None                                           # latest EMA BUY of this time frame (buy side)
-    eb = find_ema_buys(df, d, n_closed)
-    if eb:
-        x = eb[-1]
-        i = x["i"]
-        cc = candle_close_ts(int(df.time[i]), sec)
-        age = max(0, (now - cc) // 60)
-        okt, bias = trend_gate("BUY")
-        e = dict(price=x["price"], time=fmt_sig_time(int(df.time[i]), sec), age_min=int(age),
-                 fresh=bool((cc + SHIFT) // 86400 == (now + SHIFT) // 86400 and age <= max(30, sec / 60 * 1.5)),
-                 late=bool(sec < 86400 and (cc + SHIFT) % 86400 >= 15 * 3600 + 900),
-                 sl=round(x["price"] - SL_ATR_MULT * float(atr[i]), 2) if SL_ATR_MULT else None,
-                 active=bool(okt), bias=bias, plan=option_plan(spot, call=False) if okt else None)
-        out["ema"] = e
     plan_cache[tf] = {"v": out, "t": time.time()}
     return out
 
@@ -1846,8 +1776,8 @@ def journal_trades(tf):
     n_closed = closed_count(df, sec, int(time.time()))
     closed = df.iloc[:n_closed].reset_index(drop=True)
     out = []
-    runs = [("ST", simulate(closed, d[:n_closed], sec < 86400)), ("EMA", simulate_ema(closed, d[:n_closed], sec < 86400))]
-    for src, x in [(a, b) for a, bs in runs for b in bs]:
+    for x in simulate(closed, d[:n_closed], sec < 86400):
+        src = "ST"
         i, j = x["i"], x["j"]
         ts = int(closed.time[i])
         tc = close_ts(ts, sec)
@@ -1871,13 +1801,15 @@ def journal_update(tf):
     now, sec = int(time.time()), TFS[tf][2]
     with jlock:
         tr = journal["trades"]
+        for k in [k for k, v in tr.items() if v.get("src") == "EMA"]:      # the EMA BUY strategy was removed: drop its old trades
+            del tr[k]
         seen_keys = set()
         for rec in new:
-            k = f"{tf}|{rec['ts']}" + ("|E" if rec.get("src") == "EMA" else "")
+            k = f"{tf}|{rec['ts']}"
             seen_keys.add(k)
             old = tr.get(k)
             if old is None:                  # live = this server saw the signal when it happened (not replayed later)
-                rec.update(seen=now, a_in=(rec["src"] == "EMA"), a_out=(rec["src"] == "EMA"),
+                rec.update(seen=now, a_in=False, a_out=False,
                            live=bool(rec["tc"] >= journal["started"] and now - rec["tc"] <= 2 * sec + 120))
                 tr[k] = rec
             elif old["status"] == "open":    # still running -> update; finished trades are never rewritten
@@ -1954,10 +1886,6 @@ def alert_entry(rec, bias=None):
     ntfy(f"NIFTY {tf} {side}", body, "high", "green_circle" if side == "BUY" else "red_circle")
 
 
-EMA_ALERTS = os.environ.get("EMA_ALERTS", "1") != "0"      # EMA BUY phone alerts (0 = off)
-ema_alerts = {}                                             # (tf, candle time) -> {"out": bool}: alerts already sent
-
-
 def candle_close_ts(ts, sec):
     c = ts + sec
     if sec < 86400:
@@ -1965,72 +1893,6 @@ def candle_close_ts(ts, sec):
         if over > 0:
             c -= over
     return c
-
-
-def alert_ema_buy(tf, px, tm, sl, bias):
-    body = (f"EMA BUY {tf} ({tm}) | Nifty {px:.2f}\n"
-            f"Price dipped to the 20 EMA and a green candle closed back above it (Supertrend is green).\n")
-    try:                                                    # BUY -> sell PE + buy far PE
-        pl = option_plan(px, call=False)
-        body += (f"SELL {pl['sell_strike']} {pl['kind']} (~Rs {pl['sell_prem']}) + BUY {pl['hedge_strike']} {pl['kind']} "
-                 f"(~Rs {pl['hedge_prem']}) | Expiry {pl['expiry']}\nCredit ~Rs {pl['credit']:,}, max loss ~Rs {pl['max_loss']:,} (1 lot)\n")
-    except Exception:
-        pass
-    body += (f"Nifty stop-loss ~{sl:.0f} ({SL_LABEL}). Exit when the {tf} Supertrend turns red (you get an alert) or at your stop-loss.")
-    if bias:
-        body += f"\nTrend OK: {bias_text(bias)} (bullish, structure agrees)"
-    ntfy(f"NIFTY {tf} EMA BUY", body, "high", "green_circle")
-
-
-def check_ema_alerts(tf):
-    """Alert for a fresh EMA BUY (same rules as the other entry alerts: fresh, before 15:15, 1h + 4h bullish) and an exit alert when Supertrend turns red."""
-    if not EMA_ALERTS or not alerts_enabled() or tf not in ALERT_TFS:
-        return
-    sec = TFS[tf][2]
-    df = fetch(tf)
-    df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
-    d, _ = supertrend(df)
-    trr = pd.concat([df.high - df.low, (df.high - df.close.shift()).abs(),
-                     (df.low - df.close.shift()).abs()], axis=1).max(axis=1)
-    atr = trr.rolling(14, min_periods=1).mean().values
-    now = int(time.time())
-    n_closed = closed_count(df, sec, now)
-    times = [int(x) for x in df["time"]]
-    for x in find_ema_buys(df, d, n_closed)[-3:]:
-        i = x["i"]
-        key = (tf, times[i])
-        if key in ema_alerts:
-            continue
-        cc = candle_close_ts(times[i], sec)
-        late = sec < 86400 and (cc + SHIFT) % 86400 >= 15 * 3600 + 900
-        if late or now - cc > max(30, sec / 60 * 1.5) * 60:
-            continue
-        okt, bias = trend_gate("BUY")
-        if not okt:
-            continue
-        sl = x["price"] - (SL_ATR_MULT or 0) * float(atr[i]) if SL_ATR_MULT else x["price"] * (1 - SL_PCT / 100)
-        try:
-            alert_ema_buy(tf, x["price"], fmt_sig_time(times[i], sec), sl, bias)
-            ema_alerts[key] = {"out": False, "px": x["price"]}
-        except Exception as e:
-            print("ema alert note:", e)
-    for key, st in list(ema_alerts.items()):
-        if key[0] != tf or st["out"] or key[1] not in times:
-            if key[0] == tf and key[1] not in times:
-                st["out"] = True
-            continue
-        j = times.index(key[1])
-        flip = next((k for k in range(j + 1, n_closed) if d[k] == -1 and d[k - 1] == 1), None)
-        if flip is None:
-            continue
-        st["out"] = True
-        if now - candle_close_ts(times[flip], sec) <= 45 * 60:
-            try:
-                px = float(df.close[flip])
-                ntfy(f"NIFTY {tf} EMA BUY EXIT", f"The {tf} Supertrend turned red ({fmt_sig_time(times[flip], sec)}) | Nifty {px:.2f} "
-                     f"(EMA BUY entry {st['px']:.2f}, {px - st['px']:+.0f} pts). Close the option positions.", "high", "checkered_flag")
-            except Exception as e:
-                print("ema alert note:", e)
 
 
 def alert_exit(rec):
@@ -2071,10 +1933,6 @@ def journal_refresh():
                 check_alerts(tf)
             except Exception as e:
                 jmeta["errors"][tf] = str(e)[:100]
-            try:
-                check_ema_alerts(tf)
-            except Exception as e:
-                print("ema alert note:", e)
         jmeta["updated"] = int(time.time())
         journal_save()
 
@@ -2125,7 +1983,7 @@ def label_ist(ts):
 def journal_view(tf, days, src="ST"):
     if tf not in JOURNAL_TFS:
         tf = "1h"
-    src = "EMA" if src == "EMA" else "ST"
+    src = "ST"
     now = int(time.time())
     with jlock:
         allrows = list(journal["trades"].values())
@@ -2149,7 +2007,7 @@ def journal_view(tf, days, src="ST"):
 def dd_view(days, src="ST"):
     """Drawdown page: for every journal time frame the running total (equity curve), the worst fall from its peak, the
     fall right now, losing streak and the worst single trade. Closed trades only (live + replayed together)."""
-    src = "EMA" if src == "EMA" else "ST"
+    src = "ST"
     now = int(time.time())
     with jlock:
         allrows = list(journal["trades"].values())
@@ -2184,12 +2042,11 @@ def dd_view(days, src="ST"):
 
 def journal_csv():
     with jlock:
-        rows = sorted(journal["trades"].values(), key=lambda r: (r["tf"], r["ts"]))
-    out = ["tf,side,entry_time,entry_price,exit_time,exit_price,exit_reason,points,percent,status,recorded_live,source"]
+        rows = sorted((v for v in journal["trades"].values() if v.get("src", "ST") == "ST"), key=lambda r: (r["tf"], r["ts"]))
+    out = ["tf,side,entry_time,entry_price,exit_time,exit_price,exit_reason,points,percent,status,recorded_live"]
     for r in rows:
         out.append(",".join(str(x) for x in (r["tf"], r["side"], r["t_in"], r["px_in"], r["t_out"] or "", r["px_out"],
-                                             r["why"], r["pts"], r["pct"], r["status"], "yes" if r["live"] else "no",
-                                             "EMA BUY" if r.get("src") == "EMA" else "Supertrend")))
+                                             r["why"], r["pts"], r["pct"], r["status"], "yes" if r["live"] else "no")))
     return "\n".join(out) + "\n"
 
 
@@ -2318,11 +2175,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     sr["end"] = t[-1]
     last_sig = (dict(side="BUY" if flips[-1]["buy"] else "SELL", ok=flips[-1]["ok"],
                      price=flips[-1]["price"], time=flips[-1]["time"]) if flips else None)
-    ebuys = find_ema_buys(df, d, n_closed)
-    for x in ebuys:                                      # arrows on the chart, in their own colour + label
-        markers.append(dict(time=t[x["i"]], position="belowBar", shape="arrowUp", color="#00b8d4", text="EMA BUY"))
     markers.sort(key=lambda m: m["time"])
-    last_ema = (dict(price=ebuys[-1]["price"], time=fmt_sig_time(int(df.time[ebuys[-1]["i"]]), sec)) if ebuys else None)
 
     planner = None
     okf = [f for f in flips if f["ok"]]
@@ -2335,7 +2188,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
                        time=f["time"], lot=LOT, rule=SL_LABEL)
 
     return json.dumps(dict(
-        tf=tf, sym=sym, candles=candles, ema=ema, st_up=st_up, st_dn=st_dn, markers=markers, last_ema=last_ema, fib=fib_swing(df, n_closed, 3 if sec >= 604800 else 5, sec),
+        tf=tf, sym=sym, candles=candles, ema=ema, st_up=st_up, st_dn=st_dn, markers=markers, fib=fib_swing(df, n_closed, 3 if sec >= 604800 else 5, sec),
         last=make_last(df, d, lag), planner=planner,
         summary=summary, last_signal=last_sig, structure=struct, liquidity=liq, sr=sr, smc=smc))
 
@@ -2529,7 +2382,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
       </div>
       <div id="pl_info"></div>
     </div>
-    <div id="stat"><span id="st"></span><span id="ema"></span><span id="lastsig"></span><span id="lastema"></span></div>
+    <div id="stat"><span id="st"></span><span id="ema"></span><span id="lastsig"></span></div>
     <div id="bias"></div>
     <div id="hunt"></div>
     <div id="chart"></div>
@@ -2541,7 +2394,6 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="sigs"></div>
     <div class="how">
       <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes.</p>
-      <p><b>EMA BUY (teal arrow on the chart):</b> price dipped down to the EMA20 line (a wick within 0.05% counts), the candle closed back above it (green, or a red candle that closed in its upper half = bounce), and Supertrend is already green. It is a pullback entry: buy the bounce off the EMA. Only finished candles, and several in a row show once. The candle where Supertrend itself turns green keeps its normal BUY arrow. You also get a phone alert for it (only when 1H and 4H are bullish, like the other BUY alerts) and an exit alert when Supertrend turns red; switch these off with <b>EMA_ALERTS=0</b> on Render. It is not in the journal or the option plan tabs yet.</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
@@ -2603,7 +2455,6 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   </div></section>
   <section class="view" id="v_dd"><div class="pad">
     <h3>Drawdown - NIFTY 50</h3>
-    <div class="scrollx" id="dsrc" style="padding-left:0"></div>
     <div class="scrollx" id="dwin"></div>
     <div id="dbox" style="margin-top:6px"><span class="mu">loading...</span></div>
     <div class="how">
@@ -2625,7 +2476,6 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   </div></section>
   <section class="view" id="v_jrnl"><div class="pad">
     <h3>Signal journal - NIFTY 50</h3>
-    <div class="scrollx" id="jsrc" style="padding-left:0"></div>
     <div class="scrollx" id="jtf"></div>
     <div class="scrollx" id="jwin"></div>
     <div id="jstats" style="margin-top:6px"></div>
@@ -2633,7 +2483,6 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="jlist"></div>
     <div class="how">
       <p><b>How it works:</b> every EMA20-confirmed Supertrend signal on 15m, 30m and 1h is recorded as a trade. Entry = close of the signal candle. Exit = opposite flip, stop-loss of 1.5 x ATR(14) from the entry price (the SL level is shown on each trade), or day-end close (same rules as the Sim line on the chart). A signal on the last candle of the day is skipped. Results are in Nifty <b>index points</b>, not option rupees.</p>
-      <p><b>Supertrend / EMA BUY</b> (first row of buttons): <b>Supertrend</b> = the flip trades above. <b>EMA BUY</b> = pullback buys: Supertrend green, a green candle dips to the EMA20 and closes above it; entry = close of that candle, exit = Supertrend turns red, stop-loss of 1.5 x ATR(14) or day-end close. Buy side only, same LIVE / Backtest recording.</p>
       <p><b>LIVE</b> = this server saw the signal when it came (a real forward test). <b>Backtest</b> = replayed from Yahoo history (15m about 30 days, 30m 60 days, 1h 6 months).</p>
       <p><b>Saving:</b> the journal is a file on the server. Render's free plan wipes that file on every redeploy or restart, so LIVE history can reset. Download it now and then: <a href="/journal.csv" style="color:var(--bl)">Download CSV</a>.</p>
       <div id="jnote"></div>
@@ -3033,10 +2882,6 @@ chart.subscribeClick(p => {                                                    /
 });
 
 /* ---------- smart money concepts: order blocks, fair value gaps, premium / discount ---------- */
-/* ---------- EMA BUY info line ---------- */
-function drawEmaInfo(x){
-  $('lastema').innerHTML = x ? 'EMA BUY: <b class="up">' + x.time + '</b> @ ' + x.price.toLocaleString() : '';
-}
 let smcSeries = [], smcLines = [], smcKey = '', lastSMC = null, showSMC = ls('sm', '1') !== '0';
 function clearSMC(){
   smcSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
@@ -3134,22 +2979,6 @@ async function loadBias(f){
 /* ---------- trade plan (Nifty only) ---------- */
 const PLANS = [['1h', 'plan'], ['15m', 'plan15']];      // [time frame, element id] - each has its own bottom tab
 function loadPlan(f){ PLANS.forEach(x => loadPlan1(x[0], x[1], f)); }
-function emaPlanHtml(p, T){
-  const e = p.ema;
-  const hd = '<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--bd)"><b>EMA BUY</b> <span class="mu">(price bounces off the EMA20 with a green candle)</span><br>';
-  if (!e) return hd + 'No ' + T + ' EMA BUY in this data yet.</div>';
-  let h = hd + T + ' EMA BUY: <b class="up">BUY</b> ' + e.time + ' @ ' + e.price.toLocaleString() + ' (' + e.age_min + ' min ago)';
-  if (p.filter && !e.active)
-    return h + '<br><b style="color:#f9a825">Trade NOT active</b> - a BUY trade needs 1H and 4H both bullish.<br>' + (e.bias ? biasRows(e.bias) : '<span class="mu">Trend check has no data right now.</span>') + '</div>';
-  if (!e.fresh) h += '<br><span style="color:#f9a825">Old signal - do not enter now; wait for the next one.</span>';
-  else if (e.late) h += '<br><span style="color:#f9a825">Signal came at 15:15 or later - better to skip a new entry today.</span>';
-  const pl = e.plan;
-  if (pl)
-    h += '<br>SELL <b>' + pl.sell_strike + ' ' + pl.kind + '</b> (~Rs ' + pl.sell_prem + ') + BUY hedge <b>' + pl.hedge_strike + ' ' + pl.kind + '</b> (~Rs ' + pl.hedge_prem + ')'
-      + '<br>Expiry ' + pl.expiry + ' | credit ~Rs ' + pl.credit.toLocaleString() + ' | max loss ~Rs ' + pl.max_loss.toLocaleString()
-      + '<br>Exit: sell premium reaches Rs ' + pl.sl_prem + (e.sl ? ', or Nifty hits ' + e.sl.toLocaleString() + ' (1.5 x ATR)' : '') + ', or ' + T + ' Supertrend turns red.';
-  return h + '</div>';
-}
 async function loadPlan1(ptf, elid, f){
   const el = $(elid);
   if (sym !== NIFTY){
@@ -3162,7 +2991,7 @@ async function loadPlan1(ptf, elid, f){
     if (p.error){ el.innerHTML = '<h3>Trade plan</h3>Could not load the plan (' + p.error + ').'; return; }
     const s = p.signal, pl = p.plan;
     const T = LBL[p.tf] || p.tf;
-    const E = emaPlanHtml(p, T);
+    const E = '';
     let h = '<h3>' + T + ' trade plan</h3><span style="color:var(--mu)">You place the orders yourself in your broker app | Nifty ' + fmt(p.spot) + ', lot ' + p.lot + '</span><br>';
     if (!s){ el.innerHTML = h + 'No ' + T + ' signal in this data yet.' + E; return; }
     const buy = s.side === 'BUY';
@@ -3328,13 +3157,11 @@ async function loadSigs(f){
 /* ---------- signal journal ---------- */
 const JTFS = ['15m','30m','1h'];
 const JWINS = [['7','7 days'],['30','30 days'],['0','All']];
-let jsrc = ls('jsrc', 'ST'); if (jsrc !== 'ST' && jsrc !== 'EMA') jsrc = 'ST';
 let jtf = ls('jtf', '1h'); if (!JTFS.includes(jtf)) jtf = '1h';
 let jwin = ls('jwin', '30'); if (!JWINS.some(x => x[0] === jwin)) jwin = '30';
 function sgn(x){ return (x > 0 ? '+' : '') + Number(x).toLocaleString(undefined, {maximumFractionDigits:1}); }
 function drawJTabs(){
-  [['jsrc', [['ST', 'Supertrend'], ['EMA', 'EMA BUY']], () => jsrc, v => { jsrc = v; ss('jsrc', v); }],
-   ['jtf', JTFS.map(x => [x, LBL[x] || x]), () => jtf, v => { jtf = v; ss('jtf', v); }],
+  [['jtf', JTFS.map(x => [x, LBL[x] || x]), () => jtf, v => { jtf = v; ss('jtf', v); }],
    ['jwin', JWINS, () => jwin, v => { jwin = v; ss('jwin', v); }]].forEach(g => {
     const box = $(g[0]); box.innerHTML = '';
     g[1].forEach(o => {
@@ -3369,7 +3196,7 @@ function statBox(title, sub, s){
 async function loadJournal(){
   const el = $('jstats');
   try{
-    const r = await fetch('/journal?tf=' + jtf + '&src=' + jsrc + '&days=' + jwin + '&_=' + Date.now());
+    const r = await fetch('/journal?tf=' + jtf + '&days=' + jwin + '&_=' + Date.now());
     const j = await r.json();
     JLOT = j.lot || 65; JCAP = j.capital || 0;
     let h = statBox('Forward test (LIVE)', 'recorded by this server as the signals came, since ' + j.started
@@ -3412,7 +3239,7 @@ async function loadAlerts(){
     const a = await (await fetch('/alerts?_=' + Date.now())).json();
     if (a.on){
       el.innerHTML = '<h4>Phone alerts: <span class="up">ON</span></h4>You get a notification for every new <b>' + a.tfs.map(x => LBL[x] || x).join(', ')
-        + '</b> signal and when it flips back (exit). Also an <b>EMA BUY</b> alert (price bounces off the EMA20 with a green candle).<br>Channels: ' + [a.ntfy ? 'ntfy' : '', a.telegram ? 'Telegram' : ''].filter(Boolean).join(' + ') + '<br><span class="mu">Sent so far: ' + a.count
+        + '</b> signal and when it flips back (exit).<br>Channels: ' + [a.ntfy ? 'ntfy' : '', a.telegram ? 'Telegram' : ''].filter(Boolean).join(' + ') + '<br><span class="mu">Sent so far: ' + a.count
         + (a.last_sent ? ' | last ' + a.last_sent : '') + (a.err ? ' | last error: ' + a.err : '') + '</span><br>'
         + '<button class="btn" style="margin-top:8px" onclick="testAlert()">Send test alert</button> <span id="amsg" class="mu">' + amsgText + '</span>';
     } else {
@@ -3611,7 +3438,6 @@ function renderData(j, want, ws){
     lastT = Math.max(lastT, j.candles[j.candles.length - 1].time);
   }
   candles.setMarkers(j.markers);
-  drawEmaInfo(j.last_ema);
   drawStructure(j.structure);
   drawLiquidity(j.liquidity);
   drawSR(j.sr);
@@ -3683,11 +3509,9 @@ loadBias(); setInterval(loadBias, 20000);
 drawJTabs(); setInterval(() => { if (view === 'jrnl') loadJournal(); }, 20000);
 
 /* ---------- Drawdown tab ---------- */
-let dsrc = ls('dsrc', 'ST'); if (dsrc !== 'ST' && dsrc !== 'EMA') dsrc = 'ST';
 let dwin = ls('dwin', '0'); if (!JWINS.some(x => x[0] === dwin)) dwin = '0';
 function drawDTabs(){
-  [['dsrc', [['ST', 'Supertrend'], ['EMA', 'EMA BUY']], () => dsrc, v => { dsrc = v; ss('dsrc', v); }],
-   ['dwin', JWINS, () => dwin, v => { dwin = v; ss('dwin', v); }]].forEach(g => {
+  [['dwin', JWINS, () => dwin, v => { dwin = v; ss('dwin', v); }]].forEach(g => {
     const box = $(g[0]); box.innerHTML = '';
     g[1].forEach(o => {
       const b = document.createElement('button');
@@ -3871,7 +3695,7 @@ async function loadOpt(){
 async function loadDD(){
   const el = $('dbox');
   try{
-    const r = await fetch('/drawdown?src=' + dsrc + '&days=' + dwin + '&_=' + Date.now());
+    const r = await fetch('/drawdown?days=' + dwin + '&_=' + Date.now());
     const j = await r.json();
     JLOT = j.lot || 65; JCAP = j.capital || 0;
     el.innerHTML = j.tfs.map(x => {

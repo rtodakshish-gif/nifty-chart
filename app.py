@@ -2868,16 +2868,34 @@ function vpDraw(){
   const g = vpcv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
   if (!showVP || !vpData || vpData.sym !== sym || W < 50) return;
   const R = W - chart.priceScale('right').width() - 1, maxW = Math.min(R * 0.42, 170), th = dark ? TH.dark : TH.light;
-  const mx = Math.max.apply(null, vpData.bins.map(b => b.buy + b.sell)) || 1;
-  g.font = '9px sans-serif'; g.textBaseline = 'middle'; g.lineJoin = 'round';
+  // merge thin price rows so every drawn row is tall enough to hold its Buy / Sell numbers (zoomed out = fewer, fatter rows)
+  const ya = candles.priceToCoordinate(vpData.poc.hi), yb = candles.priceToCoordinate(vpData.poc.lo);
+  const bpx = (ya != null && yb != null) ? Math.abs(yb - ya) : 0, k = bpx > 0 ? Math.max(1, Math.ceil(14 / bpx)) : 1;
+  let rows = vpData.bins;
+  if (k > 1){
+    const base = vpData.bins[0].lo, sp = vpData.step * k, m = {};
+    vpData.bins.forEach(b => {
+      const gi = Math.floor((b.lo - base) / sp + 1e-6), r = m[gi] || (m[gi] = {lo: base + gi * sp, hi: base + (gi + 1) * sp, buy: 0, sell: 0});
+      r.buy += b.buy; r.sell += b.sell;
+    });
+    rows = Object.keys(m).map(x => m[x]);
+  }
+  const mx = Math.max.apply(null, rows.map(b => b.buy + b.sell)) || 1;
+  g.font = '10px sans-serif'; g.textBaseline = 'middle'; g.lineJoin = 'round';
   const label = (txt, x, y, col, al) => { g.textAlign = al; g.lineWidth = 3; g.strokeStyle = th.bg; g.strokeText(txt, x, y); g.fillStyle = col; g.fillText(txt, x, y); };
-  vpData.bins.forEach(b => {
+  const gB = dark ? '#66bb6a' : '#2e7d32', rR = dark ? '#ef5350' : '#c62828';
+  const pocY = candles.priceToCoordinate((vpData.poc.lo + vpData.poc.hi) / 2);      // the POC line already carries its own B / S text
+  rows.forEach(b => {
     const y1 = candles.priceToCoordinate(b.hi), y2 = candles.priceToCoordinate(b.lo);
     if (y1 == null || y2 == null || y2 < 0 || y1 > H) return;
     const h = Math.max(1, y2 - y1 - 1), ws = b.sell / mx * maxW, wb = b.buy / mx * maxW;
     g.fillStyle = 'rgba(223,81,76,.5)'; g.fillRect(R - ws, y1 + 0.5, ws, h);
     g.fillStyle = 'rgba(76,175,80,.5)'; g.fillRect(R - ws - wb, y1 + 0.5, wb, h);
-    if (h >= 10) label('B ' + vpF(b.buy) + '  S ' + vpF(b.sell), R - ws - wb - 4, y1 + h / 2 + 0.5, th.tx, 'right');
+    if (h >= 11 && !(pocY != null && Math.abs(y1 + h / 2 - pocY) < 8)){                                                  // "B 12K  S 9K" written next to the bar: buy in green, sell in red
+      const ty = y1 + h / 2 + 0.5, st = 'S ' + vpF(b.sell), bt = 'B ' + vpF(b.buy), x0 = R - ws - wb - 4;
+      label(st, x0, ty, rR, 'right');
+      label(bt, x0 - g.measureText(st).width - 8, ty, gB, 'right');
+    }
   });
   const line = (price, col, dash, txt) => {
     const y = candles.priceToCoordinate(price); if (y == null || y < 0 || y > H) return;

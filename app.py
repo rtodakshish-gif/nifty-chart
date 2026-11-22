@@ -2867,7 +2867,7 @@ function vpDraw(){
   if (vpcv.width !== Math.round(W * dpr) || vpcv.height !== Math.round(H * dpr)){ vpcv.width = Math.round(W * dpr); vpcv.height = Math.round(H * dpr); vpcv.style.width = W + 'px'; vpcv.style.height = H + 'px'; }
   const g = vpcv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
   if (!showVP || !vpData || vpData.sym !== sym || W < 50) return;
-  const R = W - chart.priceScale('right').width() - 1, maxW = Math.min(R * 0.42, 170), th = dark ? TH.dark : TH.light;
+  const R = W - chart.priceScale('right').width() - 1, maxW = Math.min(R * 0.5, 230), th = dark ? TH.dark : TH.light;
   // merge thin price rows so every drawn row is tall enough to hold its Buy / Sell numbers (zoomed out = fewer, fatter rows)
   const ya = candles.priceToCoordinate(vpData.poc.hi), yb = candles.priceToCoordinate(vpData.poc.lo);
   const bpx = (ya != null && yb != null) ? Math.abs(yb - ya) : 0, k = bpx > 0 ? Math.max(1, Math.ceil(14 / bpx)) : 1;
@@ -2889,12 +2889,23 @@ function vpDraw(){
     const y1 = candles.priceToCoordinate(b.hi), y2 = candles.priceToCoordinate(b.lo);
     if (y1 == null || y2 == null || y2 < 0 || y1 > H) return;
     const h = Math.max(1, y2 - y1 - 1), ws = b.sell / mx * maxW, wb = b.buy / mx * maxW;
-    g.fillStyle = 'rgba(223,81,76,.5)'; g.fillRect(R - ws, y1 + 0.5, ws, h);
-    g.fillStyle = 'rgba(76,175,80,.5)'; g.fillRect(R - ws - wb, y1 + 0.5, wb, h);
-    if (h >= 11 && !(pocY != null && Math.abs(y1 + h / 2 - pocY) < 8)){                                                  // "B 12K  S 9K" written next to the bar: buy in green, sell in red
-      const ty = y1 + h / 2 + 0.5, st = 'S ' + vpF(b.sell), bt = 'B ' + vpF(b.buy), x0 = R - ws - wb - 4;
-      label(st, x0, ty, rR, 'right');
-      label(bt, x0 - g.measureText(st).width - 8, ty, gB, 'right');
+    g.fillStyle = 'rgba(229,57,53,.78)'; g.fillRect(R - ws, y1 + 0.5, ws, h);         // sell = red, next to the price scale
+    g.fillStyle = 'rgba(67,160,71,.78)'; g.fillRect(R - ws - wb, y1 + 0.5, wb, h);    // buy = green, to its left
+    if (h >= 11 && !(pocY != null && Math.abs(y1 + h / 2 - pocY) < 8)){
+      const ty = y1 + h / 2 + 0.5, st = vpF(b.sell), bt = vpF(b.buy);
+      g.font = 'bold 10px sans-serif';
+      const sw = g.measureText(st).width, bw = g.measureText(bt).width;
+      if (ws >= sw + 6 && wb >= bw + 6){                           // both numbers fit inside their own coloured bar
+        g.textBaseline = 'middle'; g.fillStyle = '#fff';
+        g.textAlign = 'right'; g.fillText(st, R - 3, ty);
+        g.textAlign = 'left'; g.fillText(bt, R - ws - wb + 3, ty);
+      } else {                                                     // thin bar: write "B .. S .." beside it instead
+        g.font = '10px sans-serif';
+        const x0 = R - ws - wb - 4, s2 = 'S ' + st;
+        label(s2, x0, ty, rR, 'right');
+        label('B ' + bt, x0 - g.measureText(s2).width - 8, ty, gB, 'right');
+      }
+      g.font = '10px sans-serif';
     }
   });
   const line = (price, col, dash, txt) => {
@@ -2911,7 +2922,7 @@ function vpInfo(){
   const el = $('vpbox'), bt = $('b_vp'); if (bt) bt.className = 'btn' + (showVP ? ' on' : '');
   el.style.display = showVP ? 'block' : 'none'; if (!showVP) return;
   const tabs = [[1, 'Today'], [3, '3 days'], [5, '5 days']].map(x => '<button class="btn' + (x[0] === vpDays ? ' on' : '') + '" onclick="setVpDays(' + x[0] + ')">' + x[1] + '</button>').join('');
-  let h = '<div><b>Volume profile</b> ' + tabs + '</div>';
+  let h = '<div><b>Volume profile</b> ' + tabs + ' <b class="up">&#9632; Buy</b> <b class="dn">&#9632; Sell</b></div>';
   if (vpErr) h += '<span class="mu">' + vpErr + '</span>';
   else if (!vpData || vpData.sym !== sym) h += '<span class="mu">loading...</span>';
   else {

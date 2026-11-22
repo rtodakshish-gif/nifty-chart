@@ -1491,15 +1491,15 @@ def nice_step(rng, want=40):
     return 10000
 
 
-def vp_build(df, days):
+def vp_build(df, days=None):
     """df: time, open, high, low, close, volume (5 minute candles). Spreads every candle's volume over the prices it traded between and
     splits it into buy / sell by where the candle closed inside its own range (close near the high = buying)."""
     day = ((df["time"] + SHIFT) // 86400).astype(int)
-    keep = sorted(set(day))[-max(1, days):]
+    keep = sorted(set(day))[-max(1, days):] if days else sorted(set(day))
     d = df[day.isin(keep)].reset_index(drop=True)
     d = d[d["volume"] > 0].reset_index(drop=True)
     if len(d) < 3:
-        raise RuntimeError("no volume in the data for this period")
+        raise RuntimeError("no volume candles in this view (5 minute volume is available for the last ~10 days only)")
     lo, hi = float(d.low.min()), float(d.high.max())
     step = nice_step(hi - lo)
     p0 = float(np.floor(lo / step) * step)
@@ -1539,12 +1539,14 @@ def vp_build(df, days):
                 poc=dict(lo=round(p0 + poc * step, 2), hi=round(p0 + (poc + 1) * step, 2), buy=round(float(buy[poc])), sell=round(float(sell[poc]))),
                 vah=round(p0 + (b + 1) * step, 2), val=round(p0 + a * step, 2),
                 top=[dict(lo=round(p0 + i * step, 2), hi=round(p0 + (i + 1) * step, 2), buy=round(float(buy[i])), sell=round(float(sell[i]))) for i in top],
-                sessions=len(keep), candles=len(d))
+                sessions=len(keep), candles=len(d), t_from=label_ist(int(d.time.iloc[0])), t_to=label_ist(int(d.time.iloc[-1])))
 
 
-def vp_view(sym, days):
+def vp_view(sym, days, t0=None, t1=None):
+    """days 1 / 3 / 5 = last sessions; t0..t1 (unix seconds) = exactly the candles that are visible on the chart."""
+    view = bool(t0 and t1 and t1 > t0)
     days = days if days in (1, 3, 5) else 1
-    key = (sym, days)
+    key = (sym, "v", int(t0) // 300, int(t1) // 300) if view else (sym, days)
     c = vp_cache.get(key)
     if c and time.time() - c["t"] < 30:
         return c["j"]
@@ -1554,8 +1556,12 @@ def vp_view(sym, days):
     px = fetch("5m", sym)[["time", "open", "high", "low", "close"]].copy()
     vol = fetch_volume(vsym)
     m = pd.merge_asof(px.sort_values("time"), vol, on="time", direction="nearest", tolerance=150).dropna(subset=["volume"])
-    j = vp_build(m, days)
-    j.update(sym=sym, days=days, vsym=vsym, proxy=vname, time=label_ist(int(time.time())))
+    if view:
+        m = m[(m["time"] >= t0 - 300) & (m["time"] <= t1)]
+    j = vp_build(m, None if view else days)
+    j.update(sym=sym, days=("view" if view else days), vsym=vsym, proxy=vname, time=label_ist(int(time.time())))
+    if len(vp_cache) > 60:
+        vp_cache.clear()
     vp_cache[key] = {"j": j, "t": time.time()}
     return j
 
@@ -2501,7 +2507,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div class="how">
       <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes.</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
-      <p><b>Volume tab (next to Fib):</b> volume profile on the chart - how much was traded at each price. Red bar = sell, green bar = buy, with the buy / sell numbers written next to each bar. <b>POC</b> (orange) = the price with the most volume, <b>VAH / VAL</b> (blue) = the top and bottom of the area that holds 70% of the volume. Choose Today / 3 days / 5 days. Nifty and Bank Nifty indexes have no volume, so the ETF volume (Nifty BeES / Bank BeES) is used; buy / sell is an estimate from the candle close, not exchange tick data.</p>
+      <p><b>Volume tab (next to Fib):</b> volume profile on the chart - how much was traded at each price. Red bar = sell, green bar = buy, with the buy / sell numbers written next to each bar. <b>POC</b> (orange) = the price with the most volume, <b>VAH / VAL</b> (blue) = the top and bottom of the area that holds 70% of the volume. Choose Visible (the profile follows the candles on your screen - scroll or zoom and it rebuilds), Today, 3 days or 5 days. Nifty and Bank Nifty indexes have no volume, so the ETF volume (Nifty BeES / Bank BeES) is used; buy / sell is an estimate from the candle close, not exchange tick data.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
       <p><b>Planner (button above the chart):</b> plan a trade on the chart. Type Entry, Stop-loss and Target, or press "Tap: Entry / SL / Target" and then tap the chart where you want the line. <b>From signal</b> fills the latest EMA-confirmed Supertrend signal of this time frame: entry = signal close, stop = 1.5 x ATR, target = 2 x risk. The panel shows risk, reward, the risk:reward ratio and your open profit/loss at the live price. Buy or sell is decided by where the stop is (below entry = buy). Lines and boxes are drawn on the chart (red = risk, green = reward). Your plan is saved on this phone, per stock. For Nifty the rupee figure is index points x lot (65); option premiums move differently. It is a planning aid, not advice.</p>
@@ -2857,8 +2863,9 @@ function drawFibLines(sw){
 }
 function fibSetLv(v){ fibLv = fibParse(v); const t = fibLv.join(', '); ss('fibl', t); $('fibin').value = t; fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
 /* ---------- volume profile: bars on the chart (red = sell, green = buy) + numbers ---------- */
-let showVP = ls('vp', '0') === '1', vpDays = Number(ls('vpd', '1')) || 1, vpData = null, vpErr = '', vpBusy = false, vpSig = '', vpRun = false;
+let showVP = ls('vp', '0') === '1', vpDays = ls('vpd', 'view') === 'view' ? 'view' : (Number(ls('vpd', 'view')) || 'view'), vpAgain = false, vpT = null, vpLast = '', vpData = null, vpErr = '', vpBusy = false, vpSig = '', vpRun = false;
 const vpcv = document.createElement('canvas'); vpcv.id = 'vpcv'; chartBox.appendChild(vpcv);
+const IST_SHIFT = 19800;
 const vpN = x => Math.round(x).toLocaleString('en-IN');
 const vpR = b => (b.hi - b.lo >= 1) ? vpN(b.lo) + '-' + vpN(b.hi) : b.lo.toFixed(2);
 const vpF = v => (Math.abs(v) >= 1e7 ? (v / 1e7).toFixed(2) + 'Cr' : oiF(v));
@@ -2921,7 +2928,7 @@ function vpDraw(){
 function vpInfo(){
   const el = $('vpbox'), bt = $('b_vp'); if (bt) bt.className = 'btn' + (showVP ? ' on' : '');
   el.style.display = showVP ? 'block' : 'none'; if (!showVP) return;
-  const tabs = [[1, 'Today'], [3, '3 days'], [5, '5 days']].map(x => '<button class="btn' + (x[0] === vpDays ? ' on' : '') + '" onclick="setVpDays(' + x[0] + ')">' + x[1] + '</button>').join('');
+  const tabs = [['view', 'Visible'], [1, 'Today'], [3, '3 days'], [5, '5 days']].map(x => '<button class="btn' + (x[0] === vpDays ? ' on' : '') + '" onclick="setVpDays(' + (x[0] === 'view' ? "'view'" : x[0]) + ')">' + x[1] + '</button>').join('');
   let h = '<div><b>Volume profile</b> ' + tabs + ' <b class="up">&#9632; Buy</b> <b class="dn">&#9632; Sell</b></div>';
   if (vpErr) h += '<span class="mu">' + vpErr + '</span>';
   else if (!vpData || vpData.sym !== sym) h += '<span class="mu">loading...</span>';
@@ -2931,7 +2938,7 @@ function vpInfo(){
       + 'POC <b>' + vpR(pc) + '</b> (B ' + vpF(pc.buy) + ' / S ' + vpF(pc.sell) + ') | VAH <b>' + vpN(d.vah) + '</b> | VAL <b>' + vpN(d.val) + '</b><br>'
       + '<details><summary>Top 5 price levels + info</summary><table><tr><th>Price</th><th>Buy</th><th>Sell</th><th>Total</th></tr>'
       + d.top.map(b => '<tr><td>' + vpR(b) + '</td><td class="up">' + vpF(b.buy) + '</td><td class="dn">' + vpF(b.sell) + '</td><td>' + vpF(b.buy + b.sell) + '</td></tr>').join('') + '</table>'
-      + '<span class="mu">' + d.sessions + ' session(s), ' + d.candles + ' x 5m candles. Volume = ' + (d.proxy ? d.proxy + ' (' + d.vsym + ') traded units - the index itself has no volume' : 'traded volume')
+      + '<span class="mu">' + (d.days === 'view' ? 'Candles on screen: ' + d.t_from + ' to ' + d.t_to + ' (' : d.sessions + ' session(s), ') + d.candles + ' x 5m candles' + (d.days === 'view' ? ')' : '') + '. Volume = ' + (d.proxy ? d.proxy + ' (' + d.vsym + ') traded units - the index itself has no volume' : 'traded volume')
       + '. Buy / Sell is an estimate from where each candle closed in its range (not exchange tick data). Updated ' + d.time + '.</span></details>';
   }
   el.innerHTML = h;
@@ -2945,23 +2952,37 @@ function vpTick(){
   }
   requestAnimationFrame(vpTick);
 }
+function vpQuery(){
+  let q = '/vprofile?sym=' + encodeURIComponent(sym) + '&days=' + (vpDays === 'view' ? 1 : vpDays);
+  if (vpDays === 'view'){
+    let r = null; try { r = chart.timeScale().getVisibleRange(); } catch(e){}
+    if (r && r.from && r.to) q += '&from=' + Math.round(Number(r.from) - IST_SHIFT) + '&to=' + Math.round(Number(r.to) - IST_SHIFT);   // chart times carry the +5:30 shift
+  }
+  return q;
+}
 async function loadVP(){
-  if (!showVP || vpBusy) return;
-  vpBusy = true; const want = sym + '|' + vpDays;
+  if (!showVP) return;
+  if (vpBusy){ vpAgain = true; return; }
+  vpBusy = true; const q = vpQuery(), want = sym + '|' + vpDays;
   try{
-    const r = await fetch('/vprofile?sym=' + encodeURIComponent(sym) + '&days=' + vpDays + '&_=' + Date.now());
+    const r = await fetch(q + '&_=' + Date.now());
     const j = await r.json();
     if (want !== sym + '|' + vpDays) return;
     if (j.error){ vpData = null; vpErr = j.error; } else { vpData = j; vpErr = ''; }
-    vpSig = ''; vpInfo(); vpDraw();
+    vpLast = q; vpSig = ''; vpInfo(); vpDraw();
   } catch(e){ vpErr = 'Could not load, trying again...'; vpInfo(); }
-  finally { vpBusy = false; }
+  finally { vpBusy = false; if (vpAgain){ vpAgain = false; setTimeout(loadVP, 50); } }
+}
+function vpRangeChanged(){                                   // chart scrolled / zoomed: rebuild the profile for the candles now on screen
+  if (!showVP || vpDays !== 'view') return;
+  clearTimeout(vpT); vpT = setTimeout(() => { if (vpQuery() !== vpLast) loadVP(); }, 450);
 }
 function vpStart(){ vpInfo(); if (showVP){ loadVP(); if (!vpRun){ vpRun = true; requestAnimationFrame(vpTick); } } else vpDraw(); }
 function toggleVP(){ showVP = !showVP; ss('vp', showVP ? '1' : '0'); vpStart(); }
-function setVpDays(n){ vpDays = n; ss('vpd', String(n)); vpData = null; vpErr = ''; vpStart(); }
+function setVpDays(n){ vpDays = n; vpLast = ''; ss('vpd', String(n)); vpData = null; vpErr = ''; vpStart(); }
 function vpSymChanged(){ vpData = null; vpErr = ''; vpSig = ''; vpDraw(); vpStart(); }
 setInterval(() => { if (showVP && !document.hidden) loadVP(); }, 60000);
+try { chart.timeScale().subscribeVisibleTimeRangeChange(vpRangeChanged); } catch(e){}
 setTimeout(vpStart, 0);
 function fibToggleChart(){ fibChart = !fibChart; ss('fibc', fibChart ? '1' : '0'); fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
 function drawFibTabs(){
@@ -4682,7 +4703,8 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/vprofile":
             q = parse_qs(u.query)
             try:
-                body = json.dumps(vp_view(clean_sym(q.get("sym", [DEFAULT_SYM])[0]), int(q.get("days", ["1"])[0]))).encode("utf-8")
+                body = json.dumps(vp_view(clean_sym(q.get("sym", [DEFAULT_SYM])[0]), int(q.get("days", ["1"])[0]),
+                                          int(float(q.get("from", ["0"])[0])), int(float(q.get("to", ["0"])[0])))).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)

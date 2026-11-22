@@ -2894,11 +2894,11 @@ function vpDraw(){
     if (h >= 11 && !(pocY != null && Math.abs(y1 + h / 2 - pocY) < 8)){
       const ty = y1 + h / 2 + 0.5, st = vpF(b.sell), bt = vpF(b.buy);
       g.font = 'bold 10px sans-serif';
-      const sw = g.measureText(st).width, bw = g.measureText(bt).width;
-      if (ws >= sw + 6 && wb >= bw + 6){                           // both numbers fit inside their own coloured bar
+      const sw = g.measureText('S ' + st).width, bw = g.measureText('B ' + bt).width;
+      if (ws >= sw + 6 && wb >= bw + 6){                           // both numbers fit inside their own coloured bar: "B .." in green, "S .." in red
         g.textBaseline = 'middle'; g.fillStyle = '#fff';
-        g.textAlign = 'right'; g.fillText(st, R - 3, ty);
-        g.textAlign = 'left'; g.fillText(bt, R - ws - wb + 3, ty);
+        g.textAlign = 'right'; g.fillText('S ' + st, R - 3, ty);
+        g.textAlign = 'left'; g.fillText('B ' + bt, R - ws - wb + 3, ty);
       } else {                                                     // thin bar: write "B .. S .." beside it instead
         g.font = '10px sans-serif';
         const x0 = R - ws - wb - 4, s2 = 'S ' + st;

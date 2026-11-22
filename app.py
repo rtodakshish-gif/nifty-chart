@@ -1461,6 +1461,105 @@ def oc_recorder():
             print("recorder note:", e)
 
 
+# ---------- volume profile ----------
+VOL_PROXY = {"^NSEI": ("NIFTYBEES.NS", "Nifty BeES ETF"), "^NSEBANK": ("BANKBEES.NS", "Bank BeES ETF")}   # an index has no traded volume: its ETF is the closest real volume
+vp_cache = {}
+
+
+def fetch_volume(vsym, interval="5m", rng="10d"):
+    last_err = None
+    for host in ("query1", "query2"):
+        try:
+            r = http.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{urlquote(vsym, safe='')}",
+                         params={"interval": interval, "range": rng, "includePrePost": "false"}, headers=HEADERS, timeout=8)
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            q = res["indicators"]["quote"][0]
+            df = pd.DataFrame({"time": res["timestamp"], "volume": q["volume"]}).dropna()
+            df["time"] = df["time"].astype(int)
+            return df.drop_duplicates("time", keep="last").sort_values("time").reset_index(drop=True)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Yahoo volume error: {last_err}")
+
+
+def nice_step(rng, want=40):
+    raw = max(rng / want, 1e-9)
+    for st in (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000):
+        if st >= raw:
+            return st
+    return 10000
+
+
+def vp_build(df, days):
+    """df: time, open, high, low, close, volume (5 minute candles). Spreads every candle's volume over the prices it traded between and
+    splits it into buy / sell by where the candle closed inside its own range (close near the high = buying)."""
+    day = ((df["time"] + SHIFT) // 86400).astype(int)
+    keep = sorted(set(day))[-max(1, days):]
+    d = df[day.isin(keep)].reset_index(drop=True)
+    d = d[d["volume"] > 0].reset_index(drop=True)
+    if len(d) < 3:
+        raise RuntimeError("no volume in the data for this period")
+    lo, hi = float(d.low.min()), float(d.high.max())
+    step = nice_step(hi - lo)
+    p0 = float(np.floor(lo / step) * step)
+    nb = int(np.ceil((hi - p0) / step)) + 1
+    buy, sell = np.zeros(nb), np.zeros(nb)
+    for o, h, l, c, v in zip(d.open, d.high, d.low, d.close, d.volume):
+        rngc = h - l
+        bf = 0.5 if rngc <= 0 else min(1.0, max(0.0, (c - l) / rngc))
+        i0, i1 = int((l - p0) // step), int((h - p0) // step)
+        if i1 <= i0 or rngc <= 0:
+            w = {i0: 1.0}
+        else:
+            w = {}
+            for i in range(i0, i1 + 1):
+                a, b = max(l, p0 + i * step), min(h, p0 + (i + 1) * step)
+                if b > a:
+                    w[i] = (b - a) / rngc
+        for i, x in w.items():
+            if 0 <= i < nb:
+                buy[i] += v * x * bf
+                sell[i] += v * x * (1 - bf)
+    tot = buy + sell
+    poc = int(np.argmax(tot))
+    need, got, a, b = 0.7 * tot.sum(), tot[poc], poc, poc          # value area: 70% of the volume, grown outwards from the POC
+    while got < need and (a > 0 or b < nb - 1):
+        up = tot[b + 1] if b < nb - 1 else -1
+        dn = tot[a - 1] if a > 0 else -1
+        if up >= dn:
+            b += 1; got += up
+        else:
+            a -= 1; got += dn
+    bins = [dict(lo=round(p0 + i * step, 2), hi=round(p0 + (i + 1) * step, 2), buy=round(float(buy[i])), sell=round(float(sell[i])))
+            for i in range(nb) if tot[i] > 0]
+    top = sorted(range(nb), key=lambda i: -tot[i])[:5]
+    B, S = float(buy.sum()), float(sell.sum())
+    return dict(bins=bins, step=step, buy=round(B), sell=round(S), delta=round(B - S), buy_pct=round(100 * B / max(B + S, 1), 1),
+                poc=dict(lo=round(p0 + poc * step, 2), hi=round(p0 + (poc + 1) * step, 2), buy=round(float(buy[poc])), sell=round(float(sell[poc]))),
+                vah=round(p0 + (b + 1) * step, 2), val=round(p0 + a * step, 2),
+                top=[dict(lo=round(p0 + i * step, 2), hi=round(p0 + (i + 1) * step, 2), buy=round(float(buy[i])), sell=round(float(sell[i]))) for i in top],
+                sessions=len(keep), candles=len(d))
+
+
+def vp_view(sym, days):
+    days = days if days in (1, 3, 5) else 1
+    key = (sym, days)
+    c = vp_cache.get(key)
+    if c and time.time() - c["t"] < 30:
+        return c["j"]
+    vsym, vname = VOL_PROXY.get(sym, (sym, None))
+    if sym == "^BSESN" or sym == "^INDIAVIX":
+        raise RuntimeError("this index has no volume data - pick NIFTY 50, BANK NIFTY or a stock")
+    px = fetch("5m", sym)[["time", "open", "high", "low", "close"]].copy()
+    vol = fetch_volume(vsym)
+    m = pd.merge_asof(px.sort_values("time"), vol, on="time", direction="nearest", tolerance=150).dropna(subset=["volume"])
+    j = vp_build(m, days)
+    j.update(sym=sym, days=days, vsym=vsym, proxy=vname, time=label_ist(int(time.time())))
+    vp_cache[key] = {"j": j, "t": time.time()}
+    return j
+
+
 def fib_view(tf, sym):
     if tf not in TFS:
         tf = "1h"
@@ -2285,7 +2384,12 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font-family:
 #biasbox td,#biasbox th{padding:2px 4px;text-align:left;font-weight:400;border-top:1px solid var(--bd)}
 #stat{padding:0 12px 4px;font-size:12px;color:var(--mu);display:flex;gap:12px;flex-wrap:wrap}
 #stat #ema{color:#8e5fb5}
-#chart{flex:1;min-height:180px}
+#chart{flex:1;min-height:180px;position:relative}
+#vpcv{position:absolute;left:0;top:0;pointer-events:none;z-index:4}
+#vpbox{display:none;padding:4px 12px 6px;font-size:12px;line-height:1.55;border-top:1px solid var(--bd);max-height:34vh;overflow-y:auto}
+#vpbox .mu{color:var(--mu);font-size:11px}
+#vpbox table{border-collapse:collapse;margin:3px 0;width:100%}
+#vpbox td,#vpbox th{padding:1px 6px 1px 0;text-align:left;font-weight:400;border-top:1px solid var(--bd)}
 #foot{padding:4px 12px 6px;font-size:11px;color:var(--mu)}
 /* signals / plan */
 .pad{padding:12px;overflow-y:auto;flex:1}
@@ -2370,7 +2474,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   <section class="view" id="v_chart">
     <div id="ch"><span id="nm">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="mkt"></span></div>
     <div class="scrollx" id="tfs"></div>
-    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_smc" onclick="toggleSMC()">SMC</button><button class="btn" id="b_liq" onclick="toggleLiq()">Liquidity</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib</button></div>
+    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_smc" onclick="toggleSMC()">SMC</button><button class="btn" id="b_liq" onclick="toggleLiq()">Liquidity</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib</button><button class="btn" id="b_vp" onclick="toggleVP()">Volume</button></div>
     <div id="pl">
       <div class="plg">
         <div><label for="pl_e">Entry</label><input id="pl_e" inputmode="decimal" autocomplete="off"></div>
@@ -2387,6 +2491,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="bias"></div>
     <div id="hunt"></div>
     <div id="chart"></div>
+    <div id="vpbox"></div>
     <div id="foot"><span id="sum"></span> <span id="upd"></span></div>
   </section>
   <section class="view" id="v_sigs"><div class="pad">
@@ -2396,6 +2501,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div class="how">
       <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes.</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
+      <p><b>Volume tab (next to Fib):</b> volume profile on the chart - how much was traded at each price. Red bar = sell, green bar = buy, with the buy / sell numbers written next to each bar. <b>POC</b> (orange) = the price with the most volume, <b>VAH / VAL</b> (blue) = the top and bottom of the area that holds 70% of the volume. Choose Today / 3 days / 5 days. Nifty and Bank Nifty indexes have no volume, so the ETF volume (Nifty BeES / Bank BeES) is used; buy / sell is an estimate from the candle close, not exchange tick data.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
       <p><b>Planner (button above the chart):</b> plan a trade on the chart. Type Entry, Stop-loss and Target, or press "Tap: Entry / SL / Target" and then tap the chart where you want the line. <b>From signal</b> fills the latest EMA-confirmed Supertrend signal of this time frame: entry = signal close, stop = 1.5 x ATR, target = 2 x risk. The panel shows risk, reward, the risk:reward ratio and your open profit/loss at the live price. Buy or sell is decided by where the stop is (below entry = buy). Lines and boxes are drawn on the chart (red = risk, green = reward). Your plan is saved on this phone, per stock. For Nifty the rupee figure is index points x lot (65); option premiums move differently. It is a planning aid, not advice.</p>
@@ -2750,6 +2856,84 @@ function drawFibLines(sw){
   });
 }
 function fibSetLv(v){ fibLv = fibParse(v); const t = fibLv.join(', '); ss('fibl', t); $('fibin').value = t; fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
+/* ---------- volume profile: bars on the chart (red = sell, green = buy) + numbers ---------- */
+let showVP = ls('vp', '0') === '1', vpDays = Number(ls('vpd', '1')) || 1, vpData = null, vpErr = '', vpBusy = false, vpSig = '', vpRun = false;
+const vpcv = document.createElement('canvas'); vpcv.id = 'vpcv'; chartBox.appendChild(vpcv);
+const vpN = x => Math.round(x).toLocaleString('en-IN');
+const vpR = b => (b.hi - b.lo >= 1) ? vpN(b.lo) + '-' + vpN(b.hi) : b.lo.toFixed(2);
+const vpF = v => (Math.abs(v) >= 1e7 ? (v / 1e7).toFixed(2) + 'Cr' : oiF(v));
+function vpDraw(){
+  const W = chartBox.clientWidth, H = chartBox.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (vpcv.width !== Math.round(W * dpr) || vpcv.height !== Math.round(H * dpr)){ vpcv.width = Math.round(W * dpr); vpcv.height = Math.round(H * dpr); vpcv.style.width = W + 'px'; vpcv.style.height = H + 'px'; }
+  const g = vpcv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+  if (!showVP || !vpData || vpData.sym !== sym || W < 50) return;
+  const R = W - chart.priceScale('right').width() - 1, maxW = Math.min(R * 0.42, 170), th = dark ? TH.dark : TH.light;
+  const mx = Math.max.apply(null, vpData.bins.map(b => b.buy + b.sell)) || 1;
+  g.font = '9px sans-serif'; g.textBaseline = 'middle'; g.lineJoin = 'round';
+  const label = (txt, x, y, col, al) => { g.textAlign = al; g.lineWidth = 3; g.strokeStyle = th.bg; g.strokeText(txt, x, y); g.fillStyle = col; g.fillText(txt, x, y); };
+  vpData.bins.forEach(b => {
+    const y1 = candles.priceToCoordinate(b.hi), y2 = candles.priceToCoordinate(b.lo);
+    if (y1 == null || y2 == null || y2 < 0 || y1 > H) return;
+    const h = Math.max(1, y2 - y1 - 1), ws = b.sell / mx * maxW, wb = b.buy / mx * maxW;
+    g.fillStyle = 'rgba(223,81,76,.5)'; g.fillRect(R - ws, y1 + 0.5, ws, h);
+    g.fillStyle = 'rgba(76,175,80,.5)'; g.fillRect(R - ws - wb, y1 + 0.5, wb, h);
+    if (h >= 10) label('B ' + vpF(b.buy) + '  S ' + vpF(b.sell), R - ws - wb - 4, y1 + h / 2 + 0.5, th.tx, 'right');
+  });
+  const line = (price, col, dash, txt) => {
+    const y = candles.priceToCoordinate(price); if (y == null || y < 0 || y > H) return;
+    g.strokeStyle = col; g.lineWidth = 1; g.setLineDash(dash); g.beginPath(); g.moveTo(0, y); g.lineTo(R, y); g.stroke(); g.setLineDash([]);
+    label(txt, 6, y - 7, col, 'left');
+  };
+  const pc = vpData.poc;
+  line(vpData.vah, '#42a5f5', [4, 3], 'VAH ' + vpN(vpData.vah));
+  line(vpData.val, '#42a5f5', [4, 3], 'VAL ' + vpN(vpData.val));
+  line((pc.lo + pc.hi) / 2, '#ff9800', [], 'POC ' + vpR(pc) + '  B ' + vpF(pc.buy) + '  S ' + vpF(pc.sell));
+}
+function vpInfo(){
+  const el = $('vpbox'), bt = $('b_vp'); if (bt) bt.className = 'btn' + (showVP ? ' on' : '');
+  el.style.display = showVP ? 'block' : 'none'; if (!showVP) return;
+  const tabs = [[1, 'Today'], [3, '3 days'], [5, '5 days']].map(x => '<button class="btn' + (x[0] === vpDays ? ' on' : '') + '" onclick="setVpDays(' + x[0] + ')">' + x[1] + '</button>').join('');
+  let h = '<div><b>Volume profile</b> ' + tabs + '</div>';
+  if (vpErr) h += '<span class="mu">' + vpErr + '</span>';
+  else if (!vpData || vpData.sym !== sym) h += '<span class="mu">loading...</span>';
+  else {
+    const d = vpData, pc = d.poc;
+    h += 'Buy <b class="up">' + vpF(d.buy) + '</b> (' + d.buy_pct + '%) | Sell <b class="dn">' + vpF(d.sell) + '</b> (' + (100 - d.buy_pct).toFixed(1) + '%) | Delta <b class="' + (d.delta >= 0 ? 'up' : 'dn') + '">' + (d.delta >= 0 ? '+' : '-') + vpF(Math.abs(d.delta)) + '</b><br>'
+      + 'POC <b>' + vpR(pc) + '</b> (B ' + vpF(pc.buy) + ' / S ' + vpF(pc.sell) + ') | VAH <b>' + vpN(d.vah) + '</b> | VAL <b>' + vpN(d.val) + '</b><br>'
+      + '<details><summary>Top 5 price levels + info</summary><table><tr><th>Price</th><th>Buy</th><th>Sell</th><th>Total</th></tr>'
+      + d.top.map(b => '<tr><td>' + vpR(b) + '</td><td class="up">' + vpF(b.buy) + '</td><td class="dn">' + vpF(b.sell) + '</td><td>' + vpF(b.buy + b.sell) + '</td></tr>').join('') + '</table>'
+      + '<span class="mu">' + d.sessions + ' session(s), ' + d.candles + ' x 5m candles. Volume = ' + (d.proxy ? d.proxy + ' (' + d.vsym + ') traded units - the index itself has no volume' : 'traded volume')
+      + '. Buy / Sell is an estimate from where each candle closed in its range (not exchange tick data). Updated ' + d.time + '.</span></details>';
+  }
+  el.innerHTML = h;
+}
+function vpTick(){
+  if (!showVP){ vpRun = false; return; }
+  if (vpData){
+    const a = candles.priceToCoordinate(vpData.poc.lo), b = candles.priceToCoordinate(vpData.poc.hi);
+    const sig = [a, b, chartBox.clientWidth, chartBox.clientHeight, chart.priceScale('right').width(), dark].join();
+    if (sig !== vpSig){ vpSig = sig; vpDraw(); }
+  }
+  requestAnimationFrame(vpTick);
+}
+async function loadVP(){
+  if (!showVP || vpBusy) return;
+  vpBusy = true; const want = sym + '|' + vpDays;
+  try{
+    const r = await fetch('/vprofile?sym=' + encodeURIComponent(sym) + '&days=' + vpDays + '&_=' + Date.now());
+    const j = await r.json();
+    if (want !== sym + '|' + vpDays) return;
+    if (j.error){ vpData = null; vpErr = j.error; } else { vpData = j; vpErr = ''; }
+    vpSig = ''; vpInfo(); vpDraw();
+  } catch(e){ vpErr = 'Could not load, trying again...'; vpInfo(); }
+  finally { vpBusy = false; }
+}
+function vpStart(){ vpInfo(); if (showVP){ loadVP(); if (!vpRun){ vpRun = true; requestAnimationFrame(vpTick); } } else vpDraw(); }
+function toggleVP(){ showVP = !showVP; ss('vp', showVP ? '1' : '0'); vpStart(); }
+function setVpDays(n){ vpDays = n; ss('vpd', String(n)); vpData = null; vpErr = ''; vpStart(); }
+function vpSymChanged(){ vpData = null; vpErr = ''; vpSig = ''; vpDraw(); vpStart(); }
+setInterval(() => { if (showVP && !document.hidden) loadVP(); }, 60000);
+setTimeout(vpStart, 0);
 function fibToggleChart(){ fibChart = !fibChart; ss('fibc', fibChart ? '1' : '0'); fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
 function drawFibTabs(){
   const box = $('ftf'); box.innerHTML = '';
@@ -3327,7 +3511,7 @@ function selectSym(s){
   sym = s; ss('nsym', s);
   for (const k in dcache) delete dcache[k];
   setLoading(true, tf);
-  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearPL(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
+  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearPL(); vpSymChanged(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
   $('nm').textContent = nm(s); $('price').textContent = '...'; $('chg').textContent = '';
   renderWatch(); setView('chart');
   bias = null; drawBias(); loadBias(); tick(); loadSigs(); loadPlan(); loadNews();
@@ -4465,6 +4649,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(make_plan(ptf)).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
+            self._send(200, "application/json", body)
+        elif u.path == "/vprofile":
+            q = parse_qs(u.query)
+            try:
+                body = json.dumps(vp_view(clean_sym(q.get("sym", [DEFAULT_SYM])[0]), int(q.get("days", ["1"])[0]))).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
         elif u.path == "/fib":
             q = parse_qs(u.query)

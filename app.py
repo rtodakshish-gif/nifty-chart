@@ -1461,111 +1461,6 @@ def oc_recorder():
             print("recorder note:", e)
 
 
-# ---------- volume profile ----------
-VOL_PROXY = {"^NSEI": ("NIFTYBEES.NS", "Nifty BeES ETF"), "^NSEBANK": ("BANKBEES.NS", "Bank BeES ETF")}   # an index has no traded volume: its ETF is the closest real volume
-vp_cache = {}
-
-
-def fetch_volume(vsym, interval="5m", rng="10d"):
-    last_err = None
-    for host in ("query1", "query2"):
-        try:
-            r = http.get(f"https://{host}.finance.yahoo.com/v8/finance/chart/{urlquote(vsym, safe='')}",
-                         params={"interval": interval, "range": rng, "includePrePost": "false"}, headers=HEADERS, timeout=8)
-            r.raise_for_status()
-            res = r.json()["chart"]["result"][0]
-            q = res["indicators"]["quote"][0]
-            df = pd.DataFrame({"time": res["timestamp"], "volume": q["volume"]}).dropna()
-            df["time"] = df["time"].astype(int)
-            return df.drop_duplicates("time", keep="last").sort_values("time").reset_index(drop=True)
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"Yahoo volume error: {last_err}")
-
-
-def nice_step(rng, want=40):
-    raw = max(rng / want, 1e-9)
-    for st in (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 5000):
-        if st >= raw:
-            return st
-    return 10000
-
-
-def vp_build(df, days=None):
-    """df: time, open, high, low, close, volume (5 minute candles). Spreads every candle's volume over the prices it traded between and
-    splits it into buy / sell by where the candle closed inside its own range (close near the high = buying)."""
-    day = ((df["time"] + SHIFT) // 86400).astype(int)
-    keep = sorted(set(day))[-max(1, days):] if days else sorted(set(day))
-    d = df[day.isin(keep)].reset_index(drop=True)
-    d = d[d["volume"] > 0].reset_index(drop=True)
-    if len(d) < 3:
-        raise RuntimeError("no volume candles in this view (5 minute volume is available for the last ~10 days only)")
-    lo, hi = float(d.low.min()), float(d.high.max())
-    step = nice_step(hi - lo)
-    p0 = float(np.floor(lo / step) * step)
-    nb = int(np.ceil((hi - p0) / step)) + 1
-    buy, sell = np.zeros(nb), np.zeros(nb)
-    for o, h, l, c, v in zip(d.open, d.high, d.low, d.close, d.volume):
-        rngc = h - l
-        bf = 0.5 if rngc <= 0 else min(1.0, max(0.0, (c - l) / rngc))
-        i0, i1 = int((l - p0) // step), int((h - p0) // step)
-        if i1 <= i0 or rngc <= 0:
-            w = {i0: 1.0}
-        else:
-            w = {}
-            for i in range(i0, i1 + 1):
-                a, b = max(l, p0 + i * step), min(h, p0 + (i + 1) * step)
-                if b > a:
-                    w[i] = (b - a) / rngc
-        for i, x in w.items():
-            if 0 <= i < nb:
-                buy[i] += v * x * bf
-                sell[i] += v * x * (1 - bf)
-    tot = buy + sell
-    poc = int(np.argmax(tot))
-    need, got, a, b = 0.7 * tot.sum(), tot[poc], poc, poc          # value area: 70% of the volume, grown outwards from the POC
-    while got < need and (a > 0 or b < nb - 1):
-        up = tot[b + 1] if b < nb - 1 else -1
-        dn = tot[a - 1] if a > 0 else -1
-        if up >= dn:
-            b += 1; got += up
-        else:
-            a -= 1; got += dn
-    bins = [dict(lo=round(p0 + i * step, 2), hi=round(p0 + (i + 1) * step, 2), buy=round(float(buy[i])), sell=round(float(sell[i])))
-            for i in range(nb) if tot[i] > 0]
-    top = sorted(range(nb), key=lambda i: -tot[i])[:5]
-    B, S = float(buy.sum()), float(sell.sum())
-    return dict(bins=bins, step=step, buy=round(B), sell=round(S), delta=round(B - S), buy_pct=round(100 * B / max(B + S, 1), 1),
-                poc=dict(lo=round(p0 + poc * step, 2), hi=round(p0 + (poc + 1) * step, 2), buy=round(float(buy[poc])), sell=round(float(sell[poc]))),
-                vah=round(p0 + (b + 1) * step, 2), val=round(p0 + a * step, 2),
-                top=[dict(lo=round(p0 + i * step, 2), hi=round(p0 + (i + 1) * step, 2), buy=round(float(buy[i])), sell=round(float(sell[i]))) for i in top],
-                sessions=len(keep), candles=len(d), t_from=label_ist(int(d.time.iloc[0])), t_to=label_ist(int(d.time.iloc[-1])))
-
-
-def vp_view(sym, days, t0=None, t1=None):
-    """days 1 / 3 / 5 = last sessions; t0..t1 (unix seconds) = exactly the candles that are visible on the chart."""
-    view = bool(t0 and t1 and t1 > t0)
-    days = days if days in (1, 3, 5) else 1
-    key = (sym, "v", int(t0) // 300, int(t1) // 300) if view else (sym, days)
-    c = vp_cache.get(key)
-    if c and time.time() - c["t"] < 30:
-        return c["j"]
-    vsym, vname = VOL_PROXY.get(sym, (sym, None))
-    if sym == "^BSESN" or sym == "^INDIAVIX":
-        raise RuntimeError("this index has no volume data - pick NIFTY 50, BANK NIFTY or a stock")
-    px = fetch("5m", sym)[["time", "open", "high", "low", "close"]].copy()
-    vol = fetch_volume(vsym)
-    m = pd.merge_asof(px.sort_values("time"), vol, on="time", direction="nearest", tolerance=150).dropna(subset=["volume"])
-    if view:
-        m = m[(m["time"] >= t0 - 300) & (m["time"] <= t1)]
-    j = vp_build(m, None if view else days)
-    j.update(sym=sym, days=("view" if view else days), vsym=vsym, proxy=vname, time=label_ist(int(time.time())))
-    if len(vp_cache) > 60:
-        vp_cache.clear()
-    vp_cache[key] = {"j": j, "t": time.time()}
-    return j
-
-
 def fib_view(tf, sym):
     if tf not in TFS:
         tf = "1h"
@@ -2216,6 +2111,116 @@ def build_live(tf, sym, df):
                            last=make_last(df, d, lag)))
 
 
+# ---------- Range Sweep strategy: impulse -> correction -> sweep of the corrective low (high) -> back into the range ----------
+RS_MIN_IMP_ATR = 3.0          # the impulse must be at least this many ATRs long
+RS_RETRACE = (0.30, 0.85)     # the correction must give back this share of the impulse (and stay above the impulse start)
+RS_MIN_RR = 1.5               # reward : risk needed to take the trade
+RS_BUF = 0.1                  # ATR buffer: stop goes this far beyond the sweep, target stops this far inside the range edge
+RS_WAIT = 4                   # candles allowed between the sweep and the close back inside the range
+
+
+def zigzag_raw(df, n_closed, N):
+    high, low = df.high.values, df.low.values
+    pts = []
+    for j in range(N, n_closed - N):
+        is_h = high[j] >= high[j - N:j + N + 1].max()
+        is_l = low[j] <= low[j - N:j + N + 1].min()
+        if is_h and is_l:
+            continue
+        if is_h:
+            pts.append([j, True, float(high[j])])
+        elif is_l:
+            pts.append([j, False, float(low[j])])
+    zz = []
+    for p in pts:
+        if zz and zz[-1][1] == p[1]:
+            if (p[2] > zz[-1][2]) if p[1] else (p[2] < zz[-1][2]):
+                zz[-1] = p
+        else:
+            zz.append(p)
+    return zz, pts
+
+
+def range_sweep(df, n_closed, t, N, atr):
+    """Bullish: swing low A -> impulse up to swing high B -> correction down to swing low C (the range is C..B). The trade is a sweep of C
+    (a candle pokes below it = sell-side liquidity taken) followed by a close back above C: BUY at that close, stop under the sweep low,
+    target just under B. Bearish is the mirror image. Every past setup is replayed on the closed candles so the stats are honest."""
+    high, low, close = df.high.values, df.low.values, df.close.values
+    n = len(df)
+    zz, raw = zigzag_raw(df, n_closed, N)
+    found = []
+    for i in range(len(zz) - 1):
+        a, b = zz[i], zz[i + 1]
+        if a[1] == b[1]:
+            continue
+        # C = the FIRST swing of the opposite kind after B: the corrective extreme as it stood before any later sweep of it
+        c = next((q for q in raw if q[0] > b[0] and q[1] != b[1]), None)
+        if c is None:
+            continue
+        up = not a[1]                                          # a is a swing low -> impulse up
+        A, B, C = a[2], b[2], c[2]
+        imp = abs(B - A)
+        if imp < RS_MIN_IMP_ATR * float(atr[b[0]]) or imp <= 0:
+            continue
+        if not (RS_RETRACE[0] <= abs(B - C) / imp <= RS_RETRACE[1]):
+            continue
+        H, L = (B, C) if up else (C, B)
+        st = dict(side="BUY" if up else "SELL", up=bool(up), t0=t[b[0]], ta=t[a[0]], tc=t[c[0]], hi=round(H, 2), lo=round(L, 2),
+                  edge=round(C, 2), origin=round(A, 2), status="watch", entry=None, sl=None, tp=None, rr=None, te=None, tx=None, ex=None)
+        sweep_k, ext = None, None
+        for k in range(c[0] + 1, n):
+            if (up and low[k] < A) or ((not up) and high[k] > A):          # the impulse start is broken: structure failed
+                st["status"] = "broken"
+                break
+            if sweep_k is None:
+                if (up and high[k] > B) or ((not up) and low[k] < B):      # price left through the far side without sweeping: no trade
+                    st["status"] = "void"
+                    break
+                if not ((up and low[k] < C) or ((not up) and high[k] > C)):
+                    continue
+                sweep_k = k
+                ext = float(low[k]) if up else float(high[k])
+            else:
+                ext = min(ext, float(low[k])) if up else max(ext, float(high[k]))
+            if k >= n_closed:                                              # the running candle: the sweep is on, waiting for its close
+                st["status"] = "sweeping"
+                break
+            back = close[k] > C if up else close[k] < C
+            if not back:
+                if k - sweep_k >= RS_WAIT:
+                    st["status"] = "expired"
+                    break
+                st["status"] = "sweeping"
+                continue
+            entry = float(close[k])
+            buf = RS_BUF * float(atr[k])
+            sl = ext - buf if up else ext + buf
+            tp = B - buf if up else B + buf
+            risk, reward = abs(entry - sl), (tp - entry) if up else (entry - tp)
+            if risk <= 0 or reward <= 0 or reward / risk < RS_MIN_RR:
+                st["status"] = "skip"
+                break
+            st.update(status="open", entry=round(entry, 2), sl=round(sl, 2), tp=round(tp, 2), rr=round(reward / risk, 2), te=t[k])
+            for m in range(k + 1, n_closed):                               # replay: stop first when both are touched in one candle
+                if (up and low[m] <= sl) or ((not up) and high[m] >= sl):
+                    st.update(status="loss", tx=t[m], ex=round(sl, 2))
+                    break
+                if (up and high[m] >= tp) or ((not up) and low[m] <= tp):
+                    st.update(status="win", tx=t[m], ex=round(tp, 2))
+                    break
+            break
+        found.append(st)
+    live = [x for x in found if x["status"] in ("watch", "sweeping")]
+    keep = [x for x in found if x["status"] in ("open", "win", "loss")] + live[-1:]
+    keep.sort(key=lambda x: x["t0"])
+    keep = keep[-8:]
+    done = [x for x in keep if x["status"] in ("win", "loss")]
+    wins = sum(1 for x in done if x["status"] == "win")
+    pts = sum(((x["ex"] - x["entry"]) if x["up"] else (x["entry"] - x["ex"])) for x in done)
+    idea = next((x for x in reversed(keep) if x["status"] in ("watch", "sweeping", "open")), None)
+    return dict(setups=keep, end=t[n - 1], idea=idea, stats=dict(n=len(done), wins=wins, pts=round(pts, 1)))
+
+
 def build_json(tf, sym=DEFAULT_SYM, df=None):
     interval, rng, sec = TFS[tf]
     intraday = sec < 86400
@@ -2274,6 +2279,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     atr14 = tr.rolling(14, min_periods=1).mean().values
     liq = liquidity_zones(df, n_closed, t, 3 if sec >= 604800 else 5, atr14)
     smc = smc_zones(df, n_closed, t, 3 if sec >= 604800 else 5, atr14, struct.pop("_all"))
+    rs = range_sweep(df, n_closed, t, 3 if sec >= 604800 else 5, atr14)
     sr_lv, sr_src = sr_levels_for(tf, sym, df, n_closed, sec, atr14)
     sr = sr_pick(sr_lv, float(df.close.iloc[-1]), sr_src)
     sr["zones"] = snap_zones(zones_1h(tf, sym, df), t)                   # always 1h zones, started on a candle of this chart
@@ -2295,7 +2301,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     return json.dumps(dict(
         tf=tf, sym=sym, candles=candles, ema=ema, st_up=st_up, st_dn=st_dn, markers=markers, fib=fib_swing(df, n_closed, 3 if sec >= 604800 else 5, sec),
         last=make_last(df, d, lag), planner=planner,
-        summary=summary, last_signal=last_sig, structure=struct, liquidity=liq, sr=sr, smc=smc))
+        summary=summary, last_signal=last_sig, structure=struct, liquidity=liq, sr=sr, smc=smc, range=rs))
 
 
 # ---------------- web page ----------------
@@ -2390,12 +2396,7 @@ html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font-family:
 #biasbox td,#biasbox th{padding:2px 4px;text-align:left;font-weight:400;border-top:1px solid var(--bd)}
 #stat{padding:0 12px 4px;font-size:12px;color:var(--mu);display:flex;gap:12px;flex-wrap:wrap}
 #stat #ema{color:#8e5fb5}
-#chart{flex:1;min-height:180px;position:relative}
-#vpcv{position:absolute;left:0;top:0;pointer-events:none;z-index:4}
-#vpbox{display:none;padding:4px 12px 6px;font-size:12px;line-height:1.55;border-top:1px solid var(--bd);max-height:34vh;overflow-y:auto}
-#vpbox .mu{color:var(--mu);font-size:11px}
-#vpbox table{border-collapse:collapse;margin:3px 0;width:100%}
-#vpbox td,#vpbox th{padding:1px 6px 1px 0;text-align:left;font-weight:400;border-top:1px solid var(--bd)}
+#chart{flex:1;min-height:180px}
 #foot{padding:4px 12px 6px;font-size:11px;color:var(--mu)}
 /* signals / plan */
 .pad{padding:12px;overflow-y:auto;flex:1}
@@ -2480,7 +2481,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   <section class="view" id="v_chart">
     <div id="ch"><span id="nm">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="mkt"></span></div>
     <div class="scrollx" id="tfs"></div>
-    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_smc" onclick="toggleSMC()">SMC</button><button class="btn" id="b_liq" onclick="toggleLiq()">Liquidity</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib</button><button class="btn" id="b_vp" onclick="toggleVP()">Volume</button></div>
+    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_smc" onclick="toggleSMC()">SMC</button><button class="btn" id="b_liq" onclick="toggleLiq()">Liquidity</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib</button><button class="btn" id="b_rs" onclick="toggleRS()">Range</button></div>
     <div id="pl">
       <div class="plg">
         <div><label for="pl_e">Entry</label><input id="pl_e" inputmode="decimal" autocomplete="off"></div>
@@ -2496,8 +2497,8 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="stat"><span id="st"></span><span id="ema"></span><span id="lastsig"></span></div>
     <div id="bias"></div>
     <div id="hunt"></div>
+    <div id="rsbox"></div>
     <div id="chart"></div>
-    <div id="vpbox"></div>
     <div id="foot"><span id="sum"></span> <span id="upd"></span></div>
   </section>
   <section class="view" id="v_sigs"><div class="pad">
@@ -2507,12 +2508,12 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div class="how">
       <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes.</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
-      <p><b>Volume tab (next to Fib):</b> volume profile on the chart - how much was traded at each price. Red bar = sell, green bar = buy, with the buy / sell numbers written next to each bar. <b>POC</b> (orange) = the price with the most volume, <b>VAH / VAL</b> (blue) = the top and bottom of the area that holds 70% of the volume. Choose Visible (the profile follows the candles on your screen - scroll or zoom and it rebuilds), Today, 3 days or 5 days. Nifty and Bank Nifty indexes have no volume, so the ETF volume (Nifty BeES / Bank BeES) is used; buy / sell is an estimate from the candle close, not exchange tick data.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
       <p><b>Planner (button above the chart):</b> plan a trade on the chart. Type Entry, Stop-loss and Target, or press "Tap: Entry / SL / Target" and then tap the chart where you want the line. <b>From signal</b> fills the latest EMA-confirmed Supertrend signal of this time frame: entry = signal close, stop = 1.5 x ATR, target = 2 x risk. The panel shows risk, reward, the risk:reward ratio and your open profit/loss at the live price. Buy or sell is decided by where the stop is (below entry = buy). Lines and boxes are drawn on the chart (red = risk, green = reward). Your plan is saved on this phone, per stock. For Nifty the rupee figure is index points x lot (65); option premiums move differently. It is a planning aid, not advice.</p>
       <p><b>Support / Resistance:</b> on 1m, 5m, 15m, 30m and 1h charts these are taken from the <b>1-hour</b> chart (so 15m entries use 1h levels; label shows 1h). Green lines (S1, S2, S3) = support below the price, red lines (R1, R2, R3) = resistance above it. S1/R1 is the nearest. (3x) = how many swing highs/lows formed there, more = stronger. When price crosses a level it flips from support to resistance or the other way.</p>
       <p><b>SMC (smart money):</b> <b>Bull OB / Bear OB</b> = order block: the last down (up) candle before the move that broke structure; price often reacts when it returns (dim = already tested once, gone when a candle closes through it). <b>FVG</b> = fair value gap, a 3-candle gap price has not filled yet (box shrinks as price fills it). <b>EQ 50%</b> = middle of the latest swing range: above it is <span class="dn">premium</span> (look for sells), below it <span class="up">discount</span> (look for buys). BOS/CHoCH (structure) has its own Structure button and the liquidity lines and sweeps have their own Liquidity button. Tap SMC to hide order blocks, FVG and EQ.</p>
+      <p><b>Range chip (Range Sweep strategy):</b> 1) a strong impulse move (at least 3 x ATR), 2) a correction back into it (30-85% of the move) - the impulse high to the corrective low is the <b>blue range box</b>, 3) price sweeps the corrective low (stop-hunt) and a candle <b>closes back inside the range</b> = BUY (for a down impulse: sweep of the corrective high and a close back below = SELL). Stop-loss just beyond the sweep, target just inside the other end of the range, needs RR of at least 1.5. The <b>green box</b> is the reward, the <b>red box</b> the risk (TP / SL markers show the result). Below the chart you see what the strategy is waiting for right now, and the last closed trades of this chart as a backtest. It is a different strategy from the Supertrend signals.</p>
       <p><b>Liquidity (live):</b> BSL = stop-losses above a swing high, SSL = below a swing low, EQH/EQL (orange) = equal highs/lows (strongest). Labels are on the price axis. Sweep (cyan) = price poked beyond a level but closed back inside (stop-hunt); yellow LIVE Sweep = happening on the running candle right now.</p>
       <p>Data: free Yahoo Finance, can be delayed. This app shows charts only, it never places orders.</p>
     </div>
@@ -2805,6 +2806,49 @@ function drawLiquidity(lq){
       + '<br>Entry ' + fmt(d.entry) + ' | SL ' + fmt(d.sl) + ' | Target ' + fmt(d.tp) + (d.rr ? ' | RR ' + d.rr : '') + warn + '</div>';
   }
 }
+/* ---------- Range Sweep strategy (impulse -> correction -> sweep -> back into the range) ---------- */
+let rsSeries = [], rsKey = '', lastRS = null, showRS = ls('rs', '1') !== '0';
+function clearRS(){
+  rsSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
+  rsSeries = []; rsKey = ''; const b = $('rsbox'); if (b) b.innerHTML = '';
+}
+function drawRS(rs){
+  lastRS = rs;
+  const bt = $('b_rs'); if (bt) bt.className = 'btn' + (showRS ? ' on' : '');
+  const key = showRS ? (sym + tf + JSON.stringify(rs)) : 'off';
+  if (key === rsKey) return;
+  clearRS(); rsKey = key;
+  if (!showRS || !rs) return;
+  rs.setups.forEach(s => {
+    const end = s.tx || rs.end;
+    zone(s.t0, s.te ? (s.tx || rs.end) : rs.end, s.lo, s.hi, '30,136,229', 0.08, '', 'rgba(30,136,229,.55)', rsSeries);      // the range: impulse high to corrective low
+    if (!s.entry) return;
+    const g = (a, b, rgb) => zone(s.te, end, Math.min(a, b), Math.max(a, b), rgb, 0.25, '', 'rgba(' + rgb + ',.0)', rsSeries);
+    g(s.entry, s.tp, '46,158,79'); g(s.entry, s.sl, '223,81,76');                                                               // reward box green, risk box red
+    const m = chart.addLineSeries({color: 'rgba(0,0,0,0)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: () => null});
+    const pts = [{time: s.te, value: s.entry}]; if (s.tx && s.tx > s.te) pts.push({time: s.tx, value: s.ex});
+    m.setData(pts);
+    const mk = [{time: s.te, position: s.up ? 'belowBar' : 'aboveBar', color: s.up ? '#26a69a' : '#ef5350', shape: s.up ? 'arrowUp' : 'arrowDown', text: 'Range ' + s.side}];
+    if (s.tx && s.tx > s.te) mk.push({time: s.tx, position: 'inBar', color: s.status === 'win' ? '#26a69a' : '#ef5350', shape: 'circle', text: s.status === 'win' ? 'TP' : 'SL'});
+    m.setMarkers(mk); rsSeries.push(m);
+  });
+  const d = rs.idea, bx = $('rsbox'); if (!bx) return;
+  const st = rs.stats, sTxt = st.n ? 'Last ' + st.n + ' closed Range trades on this chart: ' + st.wins + ' win / ' + (st.n - st.wins) + ' loss, ' + (st.pts >= 0 ? '+' : '') + st.pts + ' pts (no costs).' : 'No finished Range trades on this chart yet.';
+  let h = '';
+  if (d){
+    const buy = d.side === 'BUY', col = buy ? '#26a69a' : '#ef5350';
+    let warn = '';
+    try { if (typeof biasOk === 'function' && !biasOk(d.side)) warn = ' <span style="color:#f9a825">| against the 1H + 4H trend filter</span>'; } catch(x){}
+    if (d.status === 'open')
+      h = '<b style="color:' + col + '">Range Sweep ' + d.side + ' - trade is on</b> <span class="mu">swept ' + fmt(d.edge) + ' and came back into the range</span><br>Entry ' + fmt(d.entry) + ' | SL ' + fmt(d.sl) + ' | Target ' + fmt(d.tp) + ' | RR ' + d.rr + warn;
+    else if (d.status === 'sweeping')
+      h = '<b style="color:#fbc02d">Range Sweep ' + d.side + ' - sweep happening</b> <span class="mu">price went ' + (buy ? 'below ' : 'above ') + fmt(d.edge) + '. A candle must CLOSE back ' + (buy ? 'above ' : 'below ') + fmt(d.edge) + ' (within ' + 4 + ' candles) = entry.</span>' + warn;
+    else
+      h = '<b style="color:' + col + '">Range Sweep ' + d.side + ' - watching</b> <span class="mu">range ' + fmt(d.lo) + ' - ' + fmt(d.hi) + '. Waiting for a sweep ' + (buy ? 'below ' : 'above ') + fmt(d.edge) + ' and a close back inside. Stop goes beyond the sweep, target ' + (buy ? 'just under ' : 'just above ') + fmt(buy ? d.hi : d.lo) + '.</span>' + warn;
+  }
+  bx.innerHTML = '<div style="font-size:12.5px;padding:2px 12px 4px;line-height:1.5">' + h + (h ? '<br>' : '') + '<span class="mu">' + sTxt + '</span></div>';
+}
+function toggleRS(){ showRS = !showRS; ss('rs', showRS ? '1' : '0'); rsKey = ''; drawRS(lastRS); }
 /* ---------- support (green) / resistance (red) ---------- */
 let srLines = [], srSeries = [], srKey = '', lastSR = null, showSR = ls('sr', '1') !== '0';
 function clearSR(){
@@ -2862,128 +2906,6 @@ function drawFibLines(sw){
   });
 }
 function fibSetLv(v){ fibLv = fibParse(v); const t = fibLv.join(', '); ss('fibl', t); $('fibin').value = t; fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
-/* ---------- volume profile: bars on the chart (red = sell, green = buy) + numbers ---------- */
-let showVP = ls('vp', '0') === '1', vpDays = ls('vpd', 'view') === 'view' ? 'view' : (Number(ls('vpd', 'view')) || 'view'), vpAgain = false, vpT = null, vpLast = '', vpData = null, vpErr = '', vpBusy = false, vpSig = '', vpRun = false;
-const vpcv = document.createElement('canvas'); vpcv.id = 'vpcv'; chartBox.appendChild(vpcv);
-const IST_SHIFT = 19800;
-const vpN = x => Math.round(x).toLocaleString('en-IN');
-const vpR = b => (b.hi - b.lo >= 1) ? vpN(b.lo) + '-' + vpN(b.hi) : b.lo.toFixed(2);
-const vpF = v => (Math.abs(v) >= 1e7 ? (v / 1e7).toFixed(2) + 'Cr' : oiF(v));
-function vpDraw(){
-  const W = chartBox.clientWidth, H = chartBox.clientHeight, dpr = window.devicePixelRatio || 1;
-  if (vpcv.width !== Math.round(W * dpr) || vpcv.height !== Math.round(H * dpr)){ vpcv.width = Math.round(W * dpr); vpcv.height = Math.round(H * dpr); vpcv.style.width = W + 'px'; vpcv.style.height = H + 'px'; }
-  const g = vpcv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
-  if (!showVP || !vpData || vpData.sym !== sym || W < 50) return;
-  const R = W - chart.priceScale('right').width() - 1, maxW = Math.min(R * 0.5, 230), th = dark ? TH.dark : TH.light;
-  // merge thin price rows so every drawn row is tall enough to hold its Buy / Sell numbers (zoomed out = fewer, fatter rows)
-  const ya = candles.priceToCoordinate(vpData.poc.hi), yb = candles.priceToCoordinate(vpData.poc.lo);
-  const bpx = (ya != null && yb != null) ? Math.abs(yb - ya) : 0, k = bpx > 0 ? Math.max(1, Math.ceil(14 / bpx)) : 1;
-  let rows = vpData.bins;
-  if (k > 1){
-    const base = vpData.bins[0].lo, sp = vpData.step * k, m = {};
-    vpData.bins.forEach(b => {
-      const gi = Math.floor((b.lo - base) / sp + 1e-6), r = m[gi] || (m[gi] = {lo: base + gi * sp, hi: base + (gi + 1) * sp, buy: 0, sell: 0});
-      r.buy += b.buy; r.sell += b.sell;
-    });
-    rows = Object.keys(m).map(x => m[x]);
-  }
-  const mx = Math.max.apply(null, rows.map(b => b.buy + b.sell)) || 1;
-  g.font = '10px sans-serif'; g.textBaseline = 'middle'; g.lineJoin = 'round';
-  const label = (txt, x, y, col, al) => { g.textAlign = al; g.lineWidth = 3; g.strokeStyle = th.bg; g.strokeText(txt, x, y); g.fillStyle = col; g.fillText(txt, x, y); };
-  const gB = dark ? '#66bb6a' : '#2e7d32', rR = dark ? '#ef5350' : '#c62828';
-  const pocY = candles.priceToCoordinate((vpData.poc.lo + vpData.poc.hi) / 2);      // the POC line already carries its own B / S text
-  rows.forEach(b => {
-    const y1 = candles.priceToCoordinate(b.hi), y2 = candles.priceToCoordinate(b.lo);
-    if (y1 == null || y2 == null || y2 < 0 || y1 > H) return;
-    const h = Math.max(1, y2 - y1 - 1), ws = b.sell / mx * maxW, wb = b.buy / mx * maxW;
-    g.fillStyle = 'rgba(229,57,53,.78)'; g.fillRect(R - ws, y1 + 0.5, ws, h);         // sell = red, next to the price scale
-    g.fillStyle = 'rgba(67,160,71,.78)'; g.fillRect(R - ws - wb, y1 + 0.5, wb, h);    // buy = green, to its left
-    if (h >= 11 && !(pocY != null && Math.abs(y1 + h / 2 - pocY) < 8)){
-      const ty = y1 + h / 2 + 0.5, st = vpF(b.sell), bt = vpF(b.buy);
-      g.font = 'bold 10px sans-serif';
-      const sw = g.measureText('S ' + st).width, bw = g.measureText('B ' + bt).width;
-      if (ws >= sw + 6 && wb >= bw + 6){                           // both numbers fit inside their own coloured bar: "B .." in green, "S .." in red
-        g.textBaseline = 'middle'; g.fillStyle = '#fff';
-        g.textAlign = 'right'; g.fillText('S ' + st, R - 3, ty);
-        g.textAlign = 'left'; g.fillText('B ' + bt, R - ws - wb + 3, ty);
-      } else {                                                     // thin bar: write "B .. S .." beside it instead
-        g.font = '10px sans-serif';
-        const x0 = R - ws - wb - 4, s2 = 'S ' + st;
-        label(s2, x0, ty, rR, 'right');
-        label('B ' + bt, x0 - g.measureText(s2).width - 8, ty, gB, 'right');
-      }
-      g.font = '10px sans-serif';
-    }
-  });
-  const line = (price, col, dash, txt) => {
-    const y = candles.priceToCoordinate(price); if (y == null || y < 0 || y > H) return;
-    g.strokeStyle = col; g.lineWidth = 1; g.setLineDash(dash); g.beginPath(); g.moveTo(0, y); g.lineTo(R, y); g.stroke(); g.setLineDash([]);
-    label(txt, 6, y - 7, col, 'left');
-  };
-  const pc = vpData.poc;
-  line(vpData.vah, '#42a5f5', [4, 3], 'VAH ' + vpN(vpData.vah));
-  line(vpData.val, '#42a5f5', [4, 3], 'VAL ' + vpN(vpData.val));
-  line((pc.lo + pc.hi) / 2, '#ff9800', [], 'POC ' + vpR(pc) + '  B ' + vpF(pc.buy) + '  S ' + vpF(pc.sell));
-}
-function vpInfo(){
-  const el = $('vpbox'), bt = $('b_vp'); if (bt) bt.className = 'btn' + (showVP ? ' on' : '');
-  el.style.display = showVP ? 'block' : 'none'; if (!showVP) return;
-  const tabs = [['view', 'Visible'], [1, 'Today'], [3, '3 days'], [5, '5 days']].map(x => '<button class="btn' + (x[0] === vpDays ? ' on' : '') + '" onclick="setVpDays(' + (x[0] === 'view' ? "'view'" : x[0]) + ')">' + x[1] + '</button>').join('');
-  let h = '<div><b>Volume profile</b> ' + tabs + ' <b class="up">&#9632; Buy</b> <b class="dn">&#9632; Sell</b></div>';
-  if (vpErr) h += '<span class="mu">' + vpErr + '</span>';
-  else if (!vpData || vpData.sym !== sym) h += '<span class="mu">loading...</span>';
-  else {
-    const d = vpData, pc = d.poc;
-    h += 'Buy <b class="up">' + vpF(d.buy) + '</b> (' + d.buy_pct + '%) | Sell <b class="dn">' + vpF(d.sell) + '</b> (' + (100 - d.buy_pct).toFixed(1) + '%) | Delta <b class="' + (d.delta >= 0 ? 'up' : 'dn') + '">' + (d.delta >= 0 ? '+' : '-') + vpF(Math.abs(d.delta)) + '</b><br>'
-      + 'POC <b>' + vpR(pc) + '</b> (B ' + vpF(pc.buy) + ' / S ' + vpF(pc.sell) + ') | VAH <b>' + vpN(d.vah) + '</b> | VAL <b>' + vpN(d.val) + '</b><br>'
-      + '<details><summary>Top 5 price levels + info</summary><table><tr><th>Price</th><th>Buy</th><th>Sell</th><th>Total</th></tr>'
-      + d.top.map(b => '<tr><td>' + vpR(b) + '</td><td class="up">' + vpF(b.buy) + '</td><td class="dn">' + vpF(b.sell) + '</td><td>' + vpF(b.buy + b.sell) + '</td></tr>').join('') + '</table>'
-      + '<span class="mu">' + (d.days === 'view' ? 'Candles on screen: ' + d.t_from + ' to ' + d.t_to + ' (' : d.sessions + ' session(s), ') + d.candles + ' x 5m candles' + (d.days === 'view' ? ')' : '') + '. Volume = ' + (d.proxy ? d.proxy + ' (' + d.vsym + ') traded units - the index itself has no volume' : 'traded volume')
-      + '. Buy / Sell is an estimate from where each candle closed in its range (not exchange tick data). Updated ' + d.time + '.</span></details>';
-  }
-  el.innerHTML = h;
-}
-function vpTick(){
-  if (!showVP){ vpRun = false; return; }
-  if (vpData){
-    const a = candles.priceToCoordinate(vpData.poc.lo), b = candles.priceToCoordinate(vpData.poc.hi);
-    const sig = [a, b, chartBox.clientWidth, chartBox.clientHeight, chart.priceScale('right').width(), dark].join();
-    if (sig !== vpSig){ vpSig = sig; vpDraw(); }
-  }
-  requestAnimationFrame(vpTick);
-}
-function vpQuery(){
-  let q = '/vprofile?sym=' + encodeURIComponent(sym) + '&days=' + (vpDays === 'view' ? 1 : vpDays);
-  if (vpDays === 'view'){
-    let r = null; try { r = chart.timeScale().getVisibleRange(); } catch(e){}
-    if (r && r.from && r.to) q += '&from=' + Math.round(Number(r.from) - IST_SHIFT) + '&to=' + Math.round(Number(r.to) - IST_SHIFT);   // chart times carry the +5:30 shift
-  }
-  return q;
-}
-async function loadVP(){
-  if (!showVP) return;
-  if (vpBusy){ vpAgain = true; return; }
-  vpBusy = true; const q = vpQuery(), want = sym + '|' + vpDays;
-  try{
-    const r = await fetch(q + '&_=' + Date.now());
-    const j = await r.json();
-    if (want !== sym + '|' + vpDays) return;
-    if (j.error){ vpData = null; vpErr = j.error; } else { vpData = j; vpErr = ''; }
-    vpLast = q; vpSig = ''; vpInfo(); vpDraw();
-  } catch(e){ vpErr = 'Could not load, trying again...'; vpInfo(); }
-  finally { vpBusy = false; if (vpAgain){ vpAgain = false; setTimeout(loadVP, 50); } }
-}
-function vpRangeChanged(){                                   // chart scrolled / zoomed: rebuild the profile for the candles now on screen
-  if (!showVP || vpDays !== 'view') return;
-  clearTimeout(vpT); vpT = setTimeout(() => { if (vpQuery() !== vpLast) loadVP(); }, 450);
-}
-function vpStart(){ vpInfo(); if (showVP){ loadVP(); if (!vpRun){ vpRun = true; requestAnimationFrame(vpTick); } } else vpDraw(); }
-function toggleVP(){ showVP = !showVP; ss('vp', showVP ? '1' : '0'); vpStart(); }
-function setVpDays(n){ vpDays = n; vpLast = ''; ss('vpd', String(n)); vpData = null; vpErr = ''; vpStart(); }
-function vpSymChanged(){ vpData = null; vpErr = ''; vpSig = ''; vpDraw(); vpStart(); }
-setInterval(() => { if (showVP && !document.hidden) loadVP(); }, 60000);
-try { chart.timeScale().subscribeVisibleTimeRangeChange(vpRangeChanged); } catch(e){}
-setTimeout(vpStart, 0);
 function fibToggleChart(){ fibChart = !fibChart; ss('fibc', fibChart ? '1' : '0'); fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
 function drawFibTabs(){
   const box = $('ftf'); box.innerHTML = '';
@@ -3561,7 +3483,7 @@ function selectSym(s){
   sym = s; ss('nsym', s);
   for (const k in dcache) delete dcache[k];
   setLoading(true, tf);
-  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearPL(); vpSymChanged(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
+  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearPL(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
   $('nm').textContent = nm(s); $('price').textContent = '...'; $('chg').textContent = '';
   renderWatch(); setView('chart');
   bias = null; drawBias(); loadBias(); tick(); loadSigs(); loadPlan(); loadNews();
@@ -3610,7 +3532,7 @@ async function tick(){
   try { await tickInner(); } finally { if (busy === key) busy = ''; }
 }
 function hardRefresh(){
-  forceNext = true; first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearPL();
+  forceNext = true; first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearPL();
   $('upd').textContent = 'refreshing...';
   tick(); loadSigs(true); loadPlan(true); loadBias(true); loadQuotes();
 }
@@ -3677,6 +3599,7 @@ function renderData(j, want, ws){
   drawLiquidity(j.liquidity);
   drawSR(j.sr);
   drawSMC(j.smc);
+  drawRS(j.range);
   drawFibLines(j.fib);
   lastPlanner = j.planner; plInfo();
   if (Date.now() - liveOk > 3000) applyLast(j.last, ws);
@@ -4699,14 +4622,6 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(make_plan(ptf)).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
-            self._send(200, "application/json", body)
-        elif u.path == "/vprofile":
-            q = parse_qs(u.query)
-            try:
-                body = json.dumps(vp_view(clean_sym(q.get("sym", [DEFAULT_SYM])[0]), int(q.get("days", ["1"])[0]),
-                                          int(float(q.get("from", ["0"])[0])), int(float(q.get("to", ["0"])[0])))).encode("utf-8")
-            except Exception as e:
-                body = json.dumps({"error": str(e)[:200]}).encode("utf-8")
             self._send(200, "application/json", body)
         elif u.path == "/fib":
             q = parse_qs(u.query)

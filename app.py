@@ -1471,6 +1471,172 @@ def fib_view(tf, sym):
                 swing=fib_swing(df, n_closed, 3 if sec >= 604800 else 5, sec))
 
 
+# ---------------- Fibonacci strategy (golden zone on a BIG time frame, entry on a SMALL one) ----------------
+FS_ZONE = (0.5, 0.618)                   # the golden zone
+FS_INV = 0.786                           # a close beyond this = the pullback is too deep, the idea has failed
+FS_LOOK = 6                              # entry candle must close beyond the high/low of the last 6 small-TF candles
+FS_WAIT = 12                             # ... within 12 small-TF candles after the zone was touched
+FS_BUF = 0.1                             # stop-loss buffer = 0.1 x ATR(14) of the small time frame
+FS_MIN_RR = 1.5
+FS_ETFS = ("1m", "5m", "15m")
+fs_cache = {}
+
+
+def fib_px(sw, r):
+    return sw["hi"] - r * (sw["hi"] - sw["lo"]) if sw["dir"] == "up" else sw["lo"] + r * (sw["hi"] - sw["lo"])
+
+
+def fib_strategy_calc(sw, dfe, n_closed_e, esec, conf=None):
+    """BIG time frame leg (sw) -> golden zone 0.5-0.618. Up-leg = BUY the pullback, down-leg = SELL the bounce.
+    On the small time frame: price touches the zone, then a closed candle breaks the high (BUY) / low (SELL) of the last 6 candles
+    -> entry at that close, stop beyond the extreme since the touch, target = the leg's end (level 0). Past setups are replayed
+    on closed candles (stop first if both are hit in one candle)."""
+    up = sw["dir"] == "up"
+    R = sw["hi"] - sw["lo"]
+    z1, z2 = sorted([fib_px(sw, FS_ZONE[0]), fib_px(sw, FS_ZONE[1])])
+    inv = fib_px(sw, FS_INV)
+    tp0 = sw["hi"] if up else sw["lo"]
+    ext = sw["hi"] + 0.272 * R if up else sw["lo"] - 0.272 * R
+    t = dfe["time"].astype("int64").values + SHIFT
+    o, h, l, c = dfe.open.values, dfe.high.values, dfe.low.values, dfe.close.values
+    n = len(dfe)
+    tr = np.maximum(h - l, np.maximum(np.abs(h - np.roll(c, 1)), np.abs(l - np.roll(c, 1))))
+    tr[0] = h[0] - l[0]
+    atr = pd.Series(tr).rolling(14, min_periods=1).mean().values
+    x0 = max(sw["x_hi"], sw["x_lo"])                           # the leg ends at its extreme; everything after it is the pullback
+    start = int(np.searchsorted(t, x0, side="right"))
+    hist, cur = [], None
+    state, k, i = "wait", None, start
+    while i < n:
+        closed = i < n_closed_e
+        if state == "wait":
+            if (c[i] < inv) if up else (c[i] > inv):
+                if closed:
+                    cur = dict(status="failed", t_touch=int(t[i]), x=int(t[i]))
+                    hist.append(cur); cur = None
+                    state = "dead"
+                    break
+            if (l[i] <= z2) if up else (h[i] >= z1):
+                state, k = "armed", i
+                ex = float(l[i]) if up else float(h[i])
+        if state == "armed":
+            if i > k:
+                ex = min(ex, float(l[i])) if up else max(ex, float(h[i]))
+            if closed and i > k:
+                if (c[i] < inv) if up else (c[i] > inv):
+                    hist.append(dict(status="failed", x=int(t[i]), t_touch=int(t[k])))
+                    state = "dead"
+                    break
+                a, b = max(k, i - FS_LOOK), i
+                if b <= a:
+                    brk = False
+                elif up:
+                    brk = bool(c[i] > h[a:b].max() and c[i] > o[i])
+                else:
+                    brk = bool(c[i] < l[a:b].min() and c[i] < o[i])
+                if brk:
+                    sl = ex - FS_BUF * atr[i] if up else ex + FS_BUF * atr[i]
+                    ent = float(c[i])
+                    risk = (ent - sl) if up else (sl - ent)
+                    reward = (tp0 - ent) if up else (ent - tp0)
+                    rr = reward / risk if risk > 0 else 0
+                    if risk > 0 and rr >= FS_MIN_RR:
+                        e = dict(status="open", side="BUY" if up else "SELL", entry=round(ent, 2), sl=round(sl, 2), tp=round(tp0, 2),
+                                 rr=round(rr, 2), x=int(t[i]), t_touch=int(t[k]), tstr=fmt_sig_time(int(dfe.time[i]), esec))
+                        for m in range(i + 1, n_closed_e):
+                            hit_sl = (l[m] <= sl) if up else (h[m] >= sl)
+                            hit_tp = (h[m] >= tp0) if up else (l[m] <= tp0)
+                            if hit_sl or hit_tp:
+                                e["status"] = "stopped" if hit_sl else "target"
+                                e["xx"] = int(t[m])
+                                e["ex"] = round(sl if hit_sl else tp0, 2)
+                                break
+                        hist.append(e)
+                        if e["status"] == "open":
+                            cur = e
+                            state = "dead"
+                            break
+                        state = "wait"            # finished trade: look for the next touch
+                        i = max(i, m)
+                        k = None
+                    else:
+                        hist.append(dict(status="skipped", x=int(t[i]), t_touch=int(t[k]), rr=round(rr, 2)))
+                        state, k = "wait", None
+                elif i - k >= FS_WAIT:
+                    hist.append(dict(status="expired", x=int(t[i]), t_touch=int(t[k])))
+                    state, k = "wait", None
+        i += 1
+    price = float(c[-1])
+    in_zone = z1 - 1e-9 <= price <= z2 + 1e-9
+    if cur:
+        st = "entry"
+    elif state == "armed":
+        st = "armed"
+    elif state == "dead" and hist and hist[-1]["status"] == "failed":
+        st = "failed"
+    else:
+        st = "waiting"
+    last_done = next((e for e in reversed(hist) if e["status"] in ("target", "stopped")), None)
+    wins = sum(1 for e in hist if e["status"] == "target")
+    loss = sum(1 for e in hist if e["status"] == "stopped")
+    return dict(side="BUY" if up else "SELL", status=st, in_zone=in_zone, price=round(price, 2),
+                zone=dict(lo=round(z1, 2), hi=round(z2, 2), inv=round(inv, 2), tp=round(tp0, 2), ext=round(ext, 2),
+                          p05=round(fib_px(sw, 0.5), 2), p618=round(fib_px(sw, 0.618), 2)),
+                trade=cur, armed=dict(x=int(t[k]), extreme=round(ex, 2)) if state == "armed" else None,
+                last=last_done, hist=hist[-6:], wins=wins, losses=loss,
+                dist=round(price - z2 if price > z2 else z1 - price if price < z1 else 0, 2), above=bool(price > z2),
+                conf=conf or [])
+
+
+def fs_confluence(sw, ltf, sym, dfl, n_closed_l, sec_l):
+    """Horizontal levels (1h support/resistance + 1h demand/supply boxes) that overlap the golden zone = stronger level."""
+    z1, z2 = sorted([fib_px(sw, FS_ZONE[0]), fib_px(sw, FS_ZONE[1])])
+    out = []
+    try:
+        trh = pd.concat([dfl.high - dfl.low, (dfl.high - dfl.close.shift()).abs(), (dfl.low - dfl.close.shift()).abs()], axis=1).max(axis=1)
+        atr_l = trh.rolling(14, min_periods=1).mean().values
+        tol = 0.25 * float(atr_l[-1])
+        lv, src = sr_levels_for(ltf, sym, dfl, n_closed_l, sec_l, atr_l)
+        for x in lv:
+            if z1 - tol <= x["price"] <= z2 + tol:
+                out.append(dict(kind="level", price=x["price"], touches=x.get("touches", 1), src=src))
+        for z in zones_1h(ltf, sym, dfl):
+            if z["lo"] <= z2 + tol and z["hi"] >= z1 - tol:
+                out.append(dict(kind="demand" if z["up"] else "supply", lo=z["lo"], hi=z["hi"]))
+    except Exception as e:
+        print("fib conf note:", e)
+    return out
+
+
+def fib_strategy(sym=DEFAULT_SYM, ltf="1h", etf="5m"):
+    if ltf not in ("15m", "30m", "1h", "4h", "1d", "1w"):
+        ltf = "1h"
+    if etf not in FS_ETFS:
+        etf = "5m"
+    key = (sym, ltf, etf)
+    c = fs_cache.get(key)
+    if c and time.time() - c["t"] < 8:
+        return c["v"]
+    now = int(time.time())
+    secl, sece = TFS[ltf][2], TFS[etf][2]
+    dfl = fetch(ltf, sym)
+    ncl = closed_count(dfl, secl, now)
+    sw = fib_swing(dfl, ncl, 3 if secl >= 604800 else 5, secl)
+    v = dict(sym=sym, ltf=ltf, etf=etf, swing=sw, ok=bool(sw))
+    if sw:
+        dfe = fetch(etf, sym)
+        nce = closed_count(dfe, sece, now)
+        conf = fs_confluence(sw, ltf, sym, dfl, ncl, secl)
+        v.update(fib_strategy_calc(sw, dfe, nce, sece, conf))
+        try:
+            b = bias_for(sym)
+            v["bias"] = dict(label=b["label"], text=bias_text(b), against=(b["dir"] != 0 and b["dir"] != (1 if v["side"] == "BUY" else -1)) or b["dir"] == 0)
+        except Exception:
+            v["bias"] = None
+    fs_cache[key] = {"v": v, "t": time.time()}
+    return v
+
+
 raw = {}                                 # tf -> {"sig": dict, "t": float}   (for the all-time-frame panel)
 sig_lock = threading.Lock()
 
@@ -2522,6 +2688,13 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <h3>Fibonacci levels</h3>
     <div class="scrollx" id="ftf" style="padding-left:0"></div>
     <div id="fbox" class="jbox"></div>
+    <div class="jbox" id="fsbox"><h4>Fib Zone strategy</h4>
+      <div class="mu" style="font-size:12px;margin:4px 0">Level = golden zone on the time frame picked above. Entry time frame:</div>
+      <div class="scrollx" id="fsetf" style="padding-left:0"></div>
+      <div id="fstxt" style="margin-top:6px"><span class="mu">loading...</span></div>
+      <div class="seg"><button class="btn" id="fs_btn" onclick="toggleFS()"></button></div>
+      <div class="mu" style="margin-top:8px;font-size:12px"><b>Rule:</b> (1) Take the last big move on the time frame above. (2) After it, price comes back into the golden zone 0.5 - 0.618 (stronger when a support/resistance or demand/supply box sits in the same zone). (3) On the small time frame (1m / 5m / 15m) a candle must close beyond the high (BUY) / low (SELL) of the last 6 candles within 12 candles of the touch. Entry = that close, stop-loss beyond the extreme since the touch, target = the end of the big move (level 0), minimum RR 1:1.5. A close beyond 0.786 cancels the idea. Past setups are replayed on closed candles. The small-time-frame trigger is the app's own rule - not a guarantee.</div>
+    </div>
     <div class="jbox"><h4>Levels</h4>
       <div class="prow" style="margin-top:6px"><input id="fibin" inputmode="decimal" autocomplete="off" placeholder="0.5, 0.618" onchange="fibSetLv(this.value)"><button class="btn" onclick="fibSetLv('0.5, 0.618')">Reset</button></div>
       <div class="mu" style="margin-top:6px;font-size:12px">Type the levels you want, separated by commas (between 0 and 1.5). Saved on this phone.</div>
@@ -2699,7 +2872,7 @@ function setView(v){
   if (v === 'jrnl') loadJournal();
   if (v === 'dd') loadDD();
   if (v === 'opt') loadOpt();
-  if (v === 'fib') loadFib();
+  if (v === 'fib'){ loadFib(); if (typeof loadFS === 'function') loadFS(); }
   if (v === 'news'){ ss('nseen', String(Math.floor(Date.now() / 1000))); $('ndot').style.display = 'none'; loadNews(); if (nview === 'ev') loadEvents(); }
   if (v === 'set'){ $('pname').value = profName(); drawProfile(); loadAlerts(); }
 }
@@ -2911,7 +3084,7 @@ function drawFibTabs(){
   const box = $('ftf'); box.innerHTML = '';
   FTFS.forEach(x => {
     const b = document.createElement('button'); b.className = 'btn' + (x === ftf ? ' on' : ''); b.textContent = LBL[x] || x;
-    b.onclick = () => { ftf = x; ss('ftf', x); drawFibTabs(); $('fbox').innerHTML = '<span class="mu">loading...</span>'; lastFib = null; loadFib(); };
+    b.onclick = () => { ftf = x; ss('ftf', x); drawFibTabs(); $('fbox').innerHTML = '<span class="mu">loading...</span>'; lastFib = null; loadFib(); lastFS = null; clearFS(); $('fstxt').innerHTML = '<span class="mu">loading...</span>'; loadFS(); };
     box.appendChild(b);
   });
 }
@@ -2956,6 +3129,95 @@ async function loadFib(){
 }
 drawFibTabs();
 setInterval(() => { if (view === 'fib') loadFib(); }, 20000);
+
+/* ---------- Fib Zone strategy: golden zone (0.5-0.618) on the big time frame, entry on a small one ---------- */
+let fsEtf = ls('fsetf', '5m'), showFS = ls('fs', '1') !== '0', fsSeries = [], fsLines = [], fsKey = '', lastFS = null;
+if (!['1m', '5m', '15m'].includes(fsEtf)) fsEtf = '5m';
+function clearFS(){
+  fsLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} });
+  fsSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
+  fsLines = []; fsSeries = []; fsKey = '';
+}
+function snapT(x){                                                             // nearest chart candle at or before x (chart times are IST-shifted)
+  if (!ctimes.length) return x;
+  let lo = 0, hi = ctimes.length - 1, r = ctimes[0];
+  while (lo <= hi){ const m = (lo + hi) >> 1; if (ctimes[m] <= x){ r = ctimes[m]; lo = m + 1; } else hi = m - 1; }
+  return r;
+}
+function drawFS(j){
+  lastFS = j;
+  const key = (showFS && j && j.ok) ? (sym + tf + ctimes.length + JSON.stringify([j.zone, j.trade, j.status, j.hist])) : 'off';
+  if (key === fsKey) return;
+  clearFS(); fsKey = key;
+  if (!showFS || !j || !j.ok || !ctimes.length) return;
+  const z = j.zone, sw = j.swing, t1 = ctimes[ctimes.length - 1];
+  const t0 = snapT(Math.max(sw.x_hi, sw.x_lo));
+  if (t0 < t1) zone(t0, t1, z.lo, z.hi, '255,179,0', 0.2, 'Fib zone', 'rgba(255,179,0,.7)', fsSeries);
+  fsLines.push(candles.createPriceLine({price: z.inv, color: '#9e9e9e', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'Fib 0.786 (fail)'}));
+  const buy = j.side === 'BUY';
+  const trades = (j.hist || []).filter(e => e.entry);
+  trades.forEach(e => {
+    const te = snapT(e.x), tx = e.xx ? snapT(e.xx) : t1, open = e.status === 'open';
+    const g = (a, b, rgb) => { if (tx > te) zone(te, tx, Math.min(a, b), Math.max(a, b), rgb, 0.22, '', 'rgba(' + rgb + ',0)', fsSeries); };
+    g(e.entry, e.tp, '46,158,79'); g(e.entry, e.sl, '223,81,76');
+    const m = chart.addLineSeries({color: 'rgba(0,0,0,0)', lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: () => null});
+    const pts = [{time: te, value: e.entry}]; if (e.xx && tx > te) pts.push({time: tx, value: e.ex});
+    m.setData(pts);
+    const mk = [{time: te, position: buy ? 'belowBar' : 'aboveBar', color: buy ? '#26a69a' : '#ef5350', shape: buy ? 'arrowUp' : 'arrowDown', text: 'Fib ' + e.side}];
+    if (e.xx && tx > te) mk.push({time: tx, position: 'inBar', color: e.status === 'target' ? '#26a69a' : '#ef5350', shape: 'circle', text: e.status === 'target' ? 'TP' : 'SL'});
+    m.setMarkers(mk); fsSeries.push(m);
+  });
+  const tr = j.trade;
+  if (tr){
+    [['ENTRY', tr.entry, '#387ed1', 0], ['SL', tr.sl, '#df514c', 2], ['TGT', tr.tp, '#4caf50', 2]].forEach(a =>
+      fsLines.push(candles.createPriceLine({price: a[1], color: a[2], lineWidth: 1, lineStyle: a[3], axisLabelVisible: true, title: 'Fib ' + a[0]})));
+  } else if (j.status !== 'failed'){
+    fsLines.push(candles.createPriceLine({price: z.tp, color: '#4caf50', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'Fib 0 (target)'}));
+  }
+}
+function drawFSCard(){
+  const b = $('fs_btn'); if (!b) return;
+  b.textContent = 'Strategy on chart: ' + (showFS ? 'ON' : 'OFF'); b.className = 'btn' + (showFS ? ' on' : '');
+  const e = $('fsetf'); e.innerHTML = '';
+  ['1m', '5m', '15m'].forEach(x => {
+    const bt = document.createElement('button'); bt.className = 'btn' + (x === fsEtf ? ' on' : ''); bt.textContent = x;
+    bt.onclick = () => { fsEtf = x; ss('fsetf', x); lastFS = null; clearFS(); drawFSCard(); $('fstxt').innerHTML = '<span class="mu">loading...</span>'; loadFS(); };
+    e.appendChild(bt);
+  });
+  const j = lastFS, box = $('fstxt');
+  if (!j){ return; }
+  if (j.error){ box.innerHTML = 'Could not load (' + j.error + ').'; return; }
+  if (!j.ok){ box.innerHTML = '<span class="mu">No clear swing yet on the ' + (LBL[j.ltf] || j.ltf) + ' chart.</span>'; return; }
+  const buy = j.side === 'BUY', col = buy ? '#26a69a' : '#ef5350', z = j.zone, L = LBL[j.ltf] || j.ltf;
+  let h = '<div><b style="color:' + col + '">' + j.side + ' idea</b> <span class="mu">(' + (buy ? 'up-move, buy the pullback' : 'down-move, sell the bounce') + ' on ' + L + ')</span></div>'
+    + '<div style="margin-top:4px">Golden zone <b>' + fmt(z.lo) + ' - ' + fmt(z.hi) + '</b> <span class="mu">(0.5 = ' + fmt(z.p05) + ', 0.618 = ' + fmt(z.p618) + ')</span><br>'
+    + 'Fails if a candle closes ' + (buy ? 'below ' : 'above ') + '<b>' + fmt(z.inv) + '</b> (0.786) | Target <b>' + fmt(z.tp) + '</b></div>';
+  const cf = j.conf || [];
+  h += '<div style="margin-top:4px">' + (cf.length ? '<b style="color:#fbc02d">Confluence:</b> ' + cf.map(c => c.kind === 'level' ? (buy ? 'support' : 'resistance') + ' ' + fmt(c.price) + ' (' + c.touches + 'x)' : (c.kind === 'demand' ? 'demand' : 'supply') + ' box ' + fmt(c.lo) + '-' + fmt(c.hi)).join(', ')
+                                        : '<span class="mu">No other level inside the zone - weaker.</span>') + '</div>';
+  const tr = j.trade;
+  let s;
+  if (tr)       s = '<b style="color:' + col + '">' + tr.side + ' trade is on</b> since ' + tr.tstr + '<br>Entry ' + fmt(tr.entry) + ' | SL ' + fmt(tr.sl) + ' | Target ' + fmt(tr.tp) + ' | RR 1:' + tr.rr;
+  else if (j.status === 'armed') s = '<b style="color:#fbc02d">Price is in the zone</b> - waiting for the ' + fsEtf + ' trigger: a ' + (buy ? 'green candle closing above' : 'red candle closing below') + ' the ' + (buy ? 'high' : 'low') + ' of the last 6 candles (within 12 candles of the touch).';
+  else if (j.status === 'failed') s = '<b class="dn">Idea failed</b> - price closed beyond 0.786. Wait for a new swing.';
+  else s = '<b>Waiting</b> - price is ' + (j.dist > 0 ? fmt(j.dist) + ' pts ' + (j.above ? 'above' : 'below') + ' the zone' : 'in the zone') + '. ' + (buy ? 'A pullback into the zone is needed first.' : 'A bounce into the zone is needed first.');
+  h += '<div style="margin-top:6px;padding:6px 8px;border-left:3px solid ' + col + '">' + s + '</div>';
+  if (j.bias && j.bias.against) h += '<div style="margin-top:4px;color:#f9a825;font-size:12.5px">Against the 1H + 4H trend filter (' + j.bias.text + ') - be careful.</div>';
+  const done = (j.wins || 0) + (j.losses || 0);
+  if (done) h += '<div class="mu" style="margin-top:4px;font-size:12px">Earlier setups on this same swing: ' + j.wins + ' target / ' + j.losses + ' stop.</div>';
+  box.innerHTML = h;
+}
+function toggleFS(){ showFS = !showFS; ss('fs', showFS ? '1' : '0'); fsKey = ''; drawFS(lastFS); drawFSCard(); }
+async function loadFS(){
+  const ws = sym, wt = ftf, we = fsEtf;
+  try{
+    const j = await (await fetch('/fibstrat?sym=' + encodeURIComponent(ws) + '&tf=' + wt + '&etf=' + we + '&_=' + Date.now())).json();
+    if (ws !== sym || wt !== ftf || we !== fsEtf) return;
+    drawFS(j); drawFSCard();
+  } catch(e){ if (!lastFS && $('fstxt')) $('fstxt').innerHTML = '<span class="mu">Could not load (connection problem).</span>'; }
+}
+drawFSCard(); loadFS();
+setInterval(() => { if (view === 'fib' || (showFS && view === 'chart')) loadFS(); }, 15000);
 
 /* ---------- entry / exit planner ---------- */
 let showPL = ls('pl', '0') === '1', plv = {e: null, s: null, t: null}, plLines = [], plSeries = [], pickMode = null, lastPlanner = null, ctimes = [], lastPx = null;
@@ -3483,9 +3745,9 @@ function selectSym(s){
   sym = s; ss('nsym', s);
   for (const k in dcache) delete dcache[k];
   setLoading(true, tf);
-  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearPL(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
+  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearFS(); lastFS = null; clearPL(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
   $('nm').textContent = nm(s); $('price').textContent = '...'; $('chg').textContent = '';
-  renderWatch(); setView('chart');
+  renderWatch(); setView('chart'); loadFS();
   bias = null; drawBias(); loadBias(); tick(); loadSigs(); loadPlan(); loadNews();
 }
 
@@ -3532,7 +3794,7 @@ async function tick(){
   try { await tickInner(); } finally { if (busy === key) busy = ''; }
 }
 function hardRefresh(){
-  forceNext = true; first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearPL();
+  forceNext = true; first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearFS(); clearPL();
   $('upd').textContent = 'refreshing...';
   tick(); loadSigs(true); loadPlan(true); loadBias(true); loadQuotes();
 }
@@ -3600,6 +3862,7 @@ function renderData(j, want, ws){
   drawSR(j.sr);
   drawSMC(j.smc);
   drawRS(j.range);
+  drawFS(lastFS);
   drawFibLines(j.fib);
   lastPlanner = j.planner; plInfo();
   if (Date.now() - liveOk > 3000) applyLast(j.last, ws);
@@ -4627,6 +4890,13 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             try:
                 body = json.dumps(fib_view(q.get("tf", ["1h"])[0], clean_sym(q.get("sym", [DEFAULT_SYM])[0]))).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"error": str(e)}).encode("utf-8")
+            self._send(200, "application/json", body)
+        elif u.path == "/fibstrat":
+            q = parse_qs(u.query)
+            try:
+                body = json.dumps(fib_strategy(clean_sym(q.get("sym", [DEFAULT_SYM])[0]), q.get("tf", ["1h"])[0], q.get("etf", ["5m"])[0])).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
             self._send(200, "application/json", body)

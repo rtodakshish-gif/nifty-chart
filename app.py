@@ -1608,11 +1608,11 @@ def fs_confluence(sw, ltf, sym, dfl, n_closed_l, sec_l):
     return out
 
 
-def fib_strategy(sym=DEFAULT_SYM, ltf="1h", etf="5m"):
+def fib_strategy(sym=DEFAULT_SYM, ltf="1h", etf="15m"):
     if ltf not in ("15m", "30m", "1h", "4h", "1d", "1w"):
         ltf = "1h"
     if etf not in FS_ETFS:
-        etf = "5m"
+        etf = "15m"
     key = (sym, ltf, etf)
     c = fs_cache.get(key)
     if c and time.time() - c["t"] < 8:
@@ -3131,8 +3131,8 @@ drawFibTabs();
 setInterval(() => { if (view === 'fib') loadFib(); }, 20000);
 
 /* ---------- Fib Zone strategy: golden zone (0.5-0.618) on the big time frame, entry on a small one ---------- */
-let fsEtf = ls('fsetf', '5m'), showFS = ls('fs', '1') !== '0', fsSeries = [], fsLines = [], fsKey = '', lastFS = null;
-if (!['1m', '5m', '15m'].includes(fsEtf)) fsEtf = '5m';
+let fsEtf = ls('fsetf', '15m'), showFS = ls('fs', '1') !== '0', fsSeries = [], fsLines = [], fsKey = '', lastFS = null;
+if (!['1m', '5m', '15m'].includes(fsEtf)) fsEtf = '15m';
 function clearFS(){
   fsLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} });
   fsSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
@@ -4896,7 +4896,7 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/fibstrat":
             q = parse_qs(u.query)
             try:
-                body = json.dumps(fib_strategy(clean_sym(q.get("sym", [DEFAULT_SYM])[0]), q.get("tf", ["1h"])[0], q.get("etf", ["5m"])[0])).encode("utf-8")
+                body = json.dumps(fib_strategy(clean_sym(q.get("sym", [DEFAULT_SYM])[0]), q.get("tf", ["1h"])[0], q.get("etf", ["15m"])[0])).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
             self._send(200, "application/json", body)

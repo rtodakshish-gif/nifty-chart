@@ -525,7 +525,7 @@ def supertrend(df):
     return d, np.where(d == 1, flb, fub)
 
 
-def simulate(df, d, intraday, confirm=True):
+def simulate(df, d, intraday, confirm=True, gate=None):
     """Enter on a signal flip (Supertrend flip confirmed by EMA20, or a CHoCH when confirm=False); exit on opposite flip, SL, or (intraday) end of day."""
     close, high, low, ema = df.close.values, df.high.values, df.low.values, df.ema.values
     opn = df.open.values
@@ -536,8 +536,8 @@ def simulate(df, d, intraday, confirm=True):
     trades, i, n = [], 1, len(df)
     while i < n:
         flip = d[i] != d[i - 1]                  # also a flip on the first candle of the day (gap open) is a signal, like on the chart
-        long_ok = flip and d[i] == 1 and (close[i] > ema[i] or not confirm)
-        short_ok = flip and d[i] == -1 and (close[i] < ema[i] or not confirm)
+        long_ok = flip and d[i] == 1 and (close[i] > ema[i] or not confirm) and (gate is None or gate[i] == 1)           # gate = 1H + 4H trend at that moment
+        short_ok = flip and d[i] == -1 and (close[i] < ema[i] or not confirm) and (gate is None or gate[i] == -1)
         if not (long_ok or short_ok):
             i += 1
             continue
@@ -988,14 +988,17 @@ def fmt_sig_time(ts, sec):
     return x.strftime("%d-%b") if sec >= 86400 else x.strftime("%d-%b %H:%M")
 
 
-def find_flips(df, d, n_closed, sec, confirm=True):
+def find_flips(df, d, n_closed, sec, confirm=True, gate=None):
     """Every Supertrend flip on a closed candle. ok = also confirmed by close vs EMA20 (bot rule)."""
     out = []
     for i in range(1, n_closed):
         if d[i] != d[i - 1]:
             buy = bool(d[i] == 1)
             c, e = float(df.close[i]), float(df.ema[i])
-            out.append(dict(i=i, buy=buy, ok=((c > e) if buy else (c < e)) if confirm else True, price=round(c, 2),
+            ok = ((c > e) if buy else (c < e)) if confirm else True
+            if gate is not None and gate[i] != (1 if buy else -1):
+                ok = False                                  # 1H + 4H do not agree with this side: shown dim, not a trade
+            out.append(dict(i=i, buy=buy, ok=ok, price=round(c, 2),
                             time=fmt_sig_time(int(df.time[i]), sec)))
     return out
 
@@ -1512,7 +1515,7 @@ def tf_signal(tf, sym=DEFAULT_SYM):
         now = int(time.time())
         n_closed = closed_count(df, sec, now)
         d, cf = signal_dir(df, tf, n_closed)
-        flips = find_flips(df, d, n_closed, sec, cf)
+        flips = find_flips(df, d, n_closed, sec, cf, gate_for(df, tf, sym))
         sig = dict(tf=tf, trend="GREEN" if d[-1] == 1 else "RED",
                    signal=(dict(side="BUY" if flips[-1]["buy"] else "SELL", ok=flips[-1]["ok"],
                                 price=flips[-1]["price"], time=flips[-1]["time"]) if flips else None))
@@ -1676,6 +1679,59 @@ def bias_for(sym=DEFAULT_SYM, force=False):
     return v
 
 
+GATED_TFS = ("15m",)                    # chart arrows, Sim and Journal of these time frames need 1H + 4H to agree (like the Plan tab)
+bseries_cache = {}
+
+
+def _dir_series(df, n_closed):
+    """Trend direction (+1 / -1 / 0) after EVERY candle of df: Supertrend colour + close vs EMA20 + market structure (same rule as tf_trend)."""
+    d, _ = supertrend(df)
+    c = df.close.values
+    ema = df.close.ewm(span=EMA_LEN, adjust=False).mean().values
+    evs = market_structure(df, n_closed, [int(x) for x in df.time.values], 5)["_all"]
+    tr, cur, e = np.zeros(len(df)), 0, 0
+    for k in range(len(df)):
+        while e < len(evs) and evs[e]["i1"] <= k:
+            cur = 1 if evs[e]["up"] else -1
+            e += 1
+        tr[k] = cur
+    out = np.where((d == 1) & (c > ema) & (tr == 1), 1, np.where((d == -1) & (c < ema) & (tr == -1), -1, 0))
+    out[:30] = 0
+    return out
+
+
+def bias_series(sym):
+    c = bseries_cache.get(sym)
+    if c and time.time() - c["t"] < 30:
+        return c["v"]
+    now = int(time.time())
+    h1 = fetch("1h", sym)
+    h4 = resample_4h(h1)
+    n1, n4 = closed_count(h1, 3600, now), int((h4["end"].values <= now).sum())
+    v = dict(e1=np.array([close_ts(int(x), 3600) for x in h1.time.values]), d1=_dir_series(h1, n1),
+             e4=h4["end"].values.astype("int64"), d4=_dir_series(h4, n4))
+    bseries_cache[sym] = {"v": v, "t": time.time()}
+    return v
+
+
+def gate_for(df, tf, sym):
+    """Per candle of df: +1 when 1H and 4H were BOTH bullish when the candle closed, -1 when both bearish, else 0. None = no filter for this chart."""
+    if not TREND_FILTER or tf not in GATED_TFS:
+        return None
+    try:
+        b = bias_series(sym)
+    except Exception as e:
+        print("gate note:", e)
+        return None
+    sec = TFS[tf][2]
+    tc = np.array([close_ts(int(x), sec) for x in df.time.values])
+    k1 = np.searchsorted(b["e1"], tc, side="right") - 1
+    k4 = np.searchsorted(b["e4"], tc, side="right") - 1
+    g1 = np.where(k1 >= 0, b["d1"][np.clip(k1, 0, None)], 0)
+    g4 = np.where(k4 >= 0, b["d4"][np.clip(k4, 0, None)], 0)
+    return np.where(g1 == g4, g1, 0)
+
+
 def trend_gate(side, sym=DEFAULT_SYM):
     """(active?, bias). A BUY trade needs BULL, a SELL trade needs BEAR. No answer from Yahoo -> not active (safe side)."""
     if not TREND_FILTER:
@@ -1810,7 +1866,8 @@ def journal_trades(tf):
     d, cf = signal_dir(df, tf, n_closed)
     closed = df.iloc[:n_closed].reset_index(drop=True)
     out = []
-    for x in simulate(closed, d[:n_closed], sec < 86400, cf):
+    gt = gate_for(df, tf, DEFAULT_SYM)
+    for x in simulate(closed, d[:n_closed], sec < 86400, cf, gt[:n_closed] if gt is not None else None):
         src = "ST"
         i, j = x["i"], x["j"]
         ts = int(closed.time[i])
@@ -1818,7 +1875,7 @@ def journal_trades(tf):
         if j == i or (tc + SHIFT) % 86400 >= 15 * 3600 + 1800:
             continue                         # signal on the last candle of the day: no time left to trade it
         pts = (x["exit"] - x["entry"]) * x["side"]
-        rec = dict(tf=tf, src=src, sig="ST", side="BUY" if x["side"] == 1 else "SELL", ts=ts, tc=tc, t_in=fmt_sig_time(ts, sec),
+        rec = dict(tf=tf, src=src, sig="ST", gate=bool(gt is not None), side="BUY" if x["side"] == 1 else "SELL", ts=ts, tc=tc, t_in=fmt_sig_time(ts, sec),
                    px_in=round(float(x["entry"]), 2), sl=round(float(x["sl"]), 2), status="open" if j is None else "closed",
                    why="OPEN" if j is None else x["why"], t_out=None, tc_out=None,
                    px_out=round(float(x["exit"]), 2), pts=round(float(pts), 2),
@@ -1837,8 +1894,8 @@ def journal_update(tf):
         tr = journal["trades"]
         for k in [k for k, v in tr.items() if v.get("src") == "EMA"]:      # the EMA BUY strategy was removed: drop its old trades
             del tr[k]
-        for k in [k for k, v in tr.items() if v.get("sig") == "CHoCH"]:      # the 15m CHoCH journal was removed: drop its trades
-            del tr[k]
+        for k in [k for k, v in tr.items() if v.get("sig") == "CHoCH" or (v["tf"] in GATED_TFS and TREND_FILTER and not v.get("gate"))]:
+            del tr[k]                        # old 15m trades (CHoCH, or taken without the 1H + 4H filter) are not comparable
         seen_keys = set()
         for rec in new:
             k = f"{tf}|{rec['ts']}"
@@ -2270,7 +2327,8 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     n_closed = closed_count(df, sec, now)
     closed = df.iloc[:n_closed].reset_index(drop=True)
     dsig, cf = signal_dir(df, tf, n_closed)                  # BUY / SELL signals: Supertrend flip + EMA20
-    trades = simulate(closed, dsig[:n_closed], intraday, cf)
+    gate = gate_for(df, tf, sym)                             # 15m: only when 1H and 4H both agree with the side
+    trades = simulate(closed, dsig[:n_closed], intraday, cf, gate[:n_closed] if gate is not None else None)
 
     t = (df["time"] + SHIFT).tolist()
     candles = [dict(time=t[i], open=round(float(df.open[i]), 2), high=round(float(df.high[i]), 2),
@@ -2280,7 +2338,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     st_dn = [dict(time=t[i], value=round(float(line[i]), 2)) if d[i] == -1 else dict(time=t[i]) for i in range(len(df))]
 
     # signals: every Supertrend flip on a closed candle (bright = EMA20-confirmed = bot rule, dim = not confirmed)
-    flips = find_flips(df, dsig, n_closed, sec, cf)
+    flips = find_flips(df, dsig, n_closed, sec, cf, gate)
     markers = []
     for f in flips:
         ti = t[f["i"]]
@@ -2305,7 +2363,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
             eq += p
             peak = max(peak, eq)
             dd = min(dd, eq - peak)
-        summary = (f"Sim {tf}, SL {SL_LABEL}: {len(pts)} trades, win {wins / len(pts) * 100:.0f}%, "
+        summary = (f"Sim {tf}{' + 1H/4H filter' if gate is not None else ''}, SL {SL_LABEL}: {len(pts)} trades, win {wins / len(pts) * 100:.0f}%, "
                    f"total {sum(pts):+.0f} pts ({sum(pct):+.2f}%), max drawdown {dd:.0f} pts (~Rs {abs(dd) * LOT:,.0f} on 1 lot = {abs(dd) * LOT / CAPITAL * 100:.1f}% of capital), no costs")
     else:
         summary = f"Sim {tf}: no completed trades in this period"
@@ -2542,7 +2600,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="biasbox"></div>
     <div id="sigs"></div>
     <div class="how">
-      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
+      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. <b>15m chart:</b> BUY / SELL (big) shows only when 1H and 4H are both bullish (BUY) or both bearish (SELL) when the signal comes; the Sim line and the Journal follow the same rule. Signals that the filter blocks are shown dim (buy / sell). The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>

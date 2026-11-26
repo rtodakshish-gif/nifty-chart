@@ -1491,15 +1491,15 @@ def choch_dir(df, n_closed):
     return d
 
 
-def signal_dir(df, tf, n_closed):
-    """(direction array that makes the BUY / SELL signals, must close vs EMA20 confirm?)"""
-    if tf in PLAN_CHOCH_TFS:
+def signal_dir(df, tf, n_closed, plan=False):
+    """(direction array that makes the BUY / SELL signals, must close vs EMA20 confirm?). Only the Plan tab of PLAN_CHOCH_TFS (15m) uses CHoCH; chart, Sim, Journal and Signals use Supertrend + EMA20."""
+    if plan and tf in PLAN_CHOCH_TFS:
         return choch_dir(df, n_closed), False
     return supertrend(df)[0], True
 
 
 def sig_name(tf):
-    return "opposite CHoCH" if tf in PLAN_CHOCH_TFS else "Supertrend flip"
+    return "Supertrend flip"
 
 
 def tf_signal(tf, sym=DEFAULT_SYM):
@@ -1711,7 +1711,7 @@ def make_plan(tf=PLAN_TF):
     atr = trr.rolling(14, min_periods=1).mean().values
     now = int(time.time())
     n_closed = closed_count(df, sec, now)
-    d, cf = signal_dir(df, tf, n_closed)
+    d, cf = signal_dir(df, tf, n_closed, True)
     flips = find_flips(df, d, n_closed, sec, cf)
     spot = float(df.close.iloc[-1])
     out = dict(tf=tf, spot=round(spot, 2), trend="GREEN" if d[-1] == 1 else "RED", signal=None, plan=None,
@@ -1818,7 +1818,7 @@ def journal_trades(tf):
         if j == i or (tc + SHIFT) % 86400 >= 15 * 3600 + 1800:
             continue                         # signal on the last candle of the day: no time left to trade it
         pts = (x["exit"] - x["entry"]) * x["side"]
-        rec = dict(tf=tf, src=src, sig="CHoCH" if tf in PLAN_CHOCH_TFS else "ST", side="BUY" if x["side"] == 1 else "SELL", ts=ts, tc=tc, t_in=fmt_sig_time(ts, sec),
+        rec = dict(tf=tf, src=src, sig="ST", side="BUY" if x["side"] == 1 else "SELL", ts=ts, tc=tc, t_in=fmt_sig_time(ts, sec),
                    px_in=round(float(x["entry"]), 2), sl=round(float(x["sl"]), 2), status="open" if j is None else "closed",
                    why="OPEN" if j is None else x["why"], t_out=None, tc_out=None,
                    px_out=round(float(x["exit"]), 2), pts=round(float(pts), 2),
@@ -1837,7 +1837,7 @@ def journal_update(tf):
         tr = journal["trades"]
         for k in [k for k, v in tr.items() if v.get("src") == "EMA"]:      # the EMA BUY strategy was removed: drop its old trades
             del tr[k]
-        for k in [k for k, v in tr.items() if v["tf"] in PLAN_CHOCH_TFS and v.get("sig") != "CHoCH"]:   # 15m now trades CHoCH: old Supertrend trades are not comparable
+        for k in [k for k, v in tr.items() if v.get("sig") == "CHoCH"]:      # the 15m CHoCH journal was removed: drop its trades
             del tr[k]
         seen_keys = set()
         for rec in new:
@@ -2269,7 +2269,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     now = int(time.time())
     n_closed = closed_count(df, sec, now)
     closed = df.iloc[:n_closed].reset_index(drop=True)
-    dsig, cf = signal_dir(df, tf, n_closed)                  # BUY / SELL signals: Supertrend flip (+EMA20), or a CHoCH on 15m
+    dsig, cf = signal_dir(df, tf, n_closed)                  # BUY / SELL signals: Supertrend flip + EMA20
     trades = simulate(closed, dsig[:n_closed], intraday, cf)
 
     t = (df["time"] + SHIFT).tolist()
@@ -2305,7 +2305,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
             eq += p
             peak = max(peak, eq)
             dd = min(dd, eq - peak)
-        summary = (f"Sim {tf}{' CHoCH' if tf in PLAN_CHOCH_TFS else ''}, SL {SL_LABEL}: {len(pts)} trades, win {wins / len(pts) * 100:.0f}%, "
+        summary = (f"Sim {tf}, SL {SL_LABEL}: {len(pts)} trades, win {wins / len(pts) * 100:.0f}%, "
                    f"total {sum(pts):+.0f} pts ({sum(pct):+.2f}%), max drawdown {dd:.0f} pts (~Rs {abs(dd) * LOT:,.0f} on 1 lot = {abs(dd) * LOT / CAPITAL * 100:.1f}% of capital), no costs")
     else:
         summary = f"Sim {tf}: no completed trades in this period"
@@ -2314,9 +2314,8 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     tr = pd.concat([df.high - df.low, (df.high - df.close.shift()).abs(),
                     (df.low - df.close.shift()).abs()], axis=1).max(axis=1)
     atr14 = tr.rolling(14, min_periods=1).mean().values
-    liq = liquidity_zones(df, n_closed, t, 3 if sec >= 604800 else 5, atr14)
-    smc = smc_zones(df, n_closed, t, 3 if sec >= 604800 else 5, atr14, struct.pop("_all"))
-    rs = range_sweep(df, n_closed, t, 3 if sec >= 604800 else 5, atr14)
+    struct.pop("_all")
+    liq = smc = rs = None                                  # SMC / Liquidity / Range chips were removed
     sr_lv, sr_src = sr_levels_for(tf, sym, df, n_closed, sec, atr14)
     sr = sr_pick(sr_lv, float(df.close.iloc[-1]), sr_src)
     sr["zones"] = snap_zones(zones_1h(tf, sym, df), t)                   # always 1h zones, started on a candle of this chart
@@ -2518,7 +2517,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   <section class="view" id="v_chart">
     <div id="ch"><span id="nm">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="mkt"></span></div>
     <div class="scrollx" id="tfs"></div>
-    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_smc" onclick="toggleSMC()">SMC</button><button class="btn" id="b_liq" onclick="toggleLiq()">Liquidity</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib</button><button class="btn" id="b_rs" onclick="toggleRS()">Range</button></div>
+    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button></div>
     <div id="pl">
       <div class="plg">
         <div><label for="pl_e">Entry</label><input id="pl_e" inputmode="decimal" autocomplete="off"></div>
@@ -2543,15 +2542,15 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="biasbox"></div>
     <div id="sigs"></div>
     <div class="how">
-      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. <b>15m chart is different:</b> BUY = CHoCH up (a candle closes above the last swing high after a down-trend), SELL = CHoCH down - no Supertrend and no EMA20 check. The Sim line, the Journal and the Plan 15m tab use the same CHoCH signals; exit = opposite CHoCH or the 1.5 x ATR stop.</p>
-      <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
+      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
+      <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
       <p><b>Planner (button above the chart):</b> plan a trade on the chart. Type Entry, Stop-loss and Target, or press "Tap: Entry / SL / Target" and then tap the chart where you want the line. <b>From signal</b> fills the latest EMA-confirmed Supertrend signal of this time frame: entry = signal close, stop = 1.5 x ATR, target = 2 x risk. The panel shows risk, reward, the risk:reward ratio and your open profit/loss at the live price. Buy or sell is decided by where the stop is (below entry = buy). Lines and boxes are drawn on the chart (red = risk, green = reward). Your plan is saved on this phone, per stock. For Nifty the rupee figure is index points x lot (65); option premiums move differently. It is a planning aid, not advice.</p>
       <p><b>Support / Resistance:</b> on 1m, 5m, 15m, 30m and 1h charts these are taken from the <b>1-hour</b> chart (so 15m entries use 1h levels; label shows 1h). Green lines (S1, S2, S3) = support below the price, red lines (R1, R2, R3) = resistance above it. S1/R1 is the nearest. (3x) = how many swing highs/lows formed there, more = stronger. When price crosses a level it flips from support to resistance or the other way.</p>
-      <p><b>SMC (smart money):</b> <b>Bull OB / Bear OB</b> = order block: the last down (up) candle before the move that broke structure; price often reacts when it returns (dim = already tested once, gone when a candle closes through it). <b>FVG</b> = fair value gap, a 3-candle gap price has not filled yet (box shrinks as price fills it). <b>EQ 50%</b> = middle of the latest swing range: above it is <span class="dn">premium</span> (look for sells), below it <span class="up">discount</span> (look for buys). BOS/CHoCH (structure) has its own Structure button and the liquidity lines and sweeps have their own Liquidity button. Tap SMC to hide order blocks, FVG and EQ.</p>
-      <p><b>Range chip (Range Sweep strategy):</b> 1) a strong impulse move (at least 3 x ATR), 2) a correction back into it (30-85% of the move) - the impulse high to the corrective low is the <b>blue range box</b>, 3) price sweeps the corrective low (stop-hunt) and a candle <b>closes back inside the range</b> = BUY (for a down impulse: sweep of the corrective high and a close back below = SELL). Stop-loss just beyond the sweep, target just inside the other end of the range, needs RR of at least 1.5. The <b>green box</b> is the reward, the <b>red box</b> the risk (TP / SL markers show the result). Below the chart you see what the strategy is waiting for right now, and the last closed trades of this chart as a backtest. It is a different strategy from the Supertrend signals.</p>
-      <p><b>Liquidity (live):</b> BSL = stop-losses above a swing high, SSL = below a swing low, EQH/EQL (orange) = equal highs/lows (strongest). Labels are on the price axis. Sweep (cyan) = price poked beyond a level but closed back inside (stop-hunt); yellow LIVE Sweep = happening on the running candle right now.</p>
+      
+      
+      
       <p>Data: free Yahoo Finance, can be delayed. This app shows charts only, it never places orders.</p>
     </div>
   </div></section>
@@ -2562,10 +2561,9 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div class="jbox"><h4>Levels</h4>
       <div class="prow" style="margin-top:6px"><input id="fibin" inputmode="decimal" autocomplete="off" placeholder="0.5, 0.618" onchange="fibSetLv(this.value)"><button class="btn" onclick="fibSetLv('0.5, 0.618')">Reset</button></div>
       <div class="mu" style="margin-top:6px;font-size:12px">Type the levels you want, separated by commas (between 0 and 1.5). Saved on this phone.</div>
-      <div class="seg"><button class="btn" id="fibc_btn" onclick="fibToggleChart()"></button></div>
     </div>
     <div class="how">
-      <p><b>How it works:</b> the app takes the latest confirmed swing high and swing low (a pivot with 5 candles on each side, 3 on the weekly chart) of the time frame you pick. When the low came first (an up-move), the levels are measured down from the high = pullback levels. When the high came first (a down-move), they are measured up from the low = bounce levels. 0.5 and 0.618 are the usual "golden zone" levels. Only closed candles decide the swing, so the levels can move when a new swing forms. With <b>Lines on chart</b> ON, the levels of the chart's own time frame are drawn as dashed yellow lines. A planning aid, not a signal on its own, not advice.</p>
+      <p><b>How it works:</b> the app takes the latest confirmed swing high and swing low (a pivot with 5 candles on each side, 3 on the weekly chart) of the time frame you pick. When the low came first (an up-move), the levels are measured down from the high = pullback levels. When the high came first (a down-move), they are measured up from the low = bounce levels. 0.5 and 0.618 are the usual "golden zone" levels. Only closed candles decide the swing, so the levels can move when a new swing forms. A planning aid, not a signal on its own, not advice.</p>
     </div>
   </div></div></section>
   <section class="view" id="v_plan15"><div class="pad"><div id="plan15"></div></div></section>
@@ -2633,7 +2631,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <h3 style="margin-top:14px">Trades</h3>
     <div id="jlist"></div>
     <div class="how">
-      <p><b>How it works:</b> every EMA20-confirmed Supertrend signal on 30m and 1h, and every CHoCH signal on 15m (CHoCH up = BUY, CHoCH down = SELL), is recorded as a trade. Entry = close of the signal candle. Exit = opposite flip, stop-loss of 1.5 x ATR(14) from the entry price (the SL level is shown on each trade), or day-end close (same rules as the Sim line on the chart). A signal on the last candle of the day is skipped. Results are in Nifty <b>index points</b>, not option rupees.</p>
+      <p><b>How it works:</b> every EMA20-confirmed Supertrend signal on 15m, 30m and 1h is recorded as a trade. Entry = close of the signal candle. Exit = opposite flip, stop-loss of 1.5 x ATR(14) from the entry price (the SL level is shown on each trade), or day-end close (same rules as the Sim line on the chart). A signal on the last candle of the day is skipped. Results are in Nifty <b>index points</b>, not option rupees.</p>
       <p><b>LIVE</b> = this server saw the signal when it came (a real forward test). <b>Backtest</b> = replayed from Yahoo history (15m about 30 days, 30m 60 days, 1h 6 months).</p>
       <p><b>Saving:</b> the journal is a file on the server. Render's free plan wipes that file on every redeploy or restart, so LIVE history can reset. Download it now and then: <a href="/journal.csv" style="color:var(--bl)">Download CSV</a>.</p>
       <div id="jnote"></div>
@@ -2798,7 +2796,7 @@ function drawStructure(st){
 }
 
 /* ---------- liquidity ---------- */
-let liqSeries = [], liqLines = [], liqKey = '', lastLiq = null, showLiq = ls('lq', '1') !== '0';
+let liqSeries = [], liqLines = [], liqKey = '', lastLiq = null, showLiq = false;
 function clearLiquidity(){
   liqSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
   liqLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} });
@@ -2806,7 +2804,6 @@ function clearLiquidity(){
 }
 function drawLiquidity(lq){
   lastLiq = lq;
-  $('b_liq').className = 'btn' + (showLiq ? ' on' : '');
   const key = showLiq ? (sym + tf + JSON.stringify(lq)) : 'off';
   if (key === liqKey) return;
   clearLiquidity(); liqKey = key;
@@ -2844,7 +2841,7 @@ function drawLiquidity(lq){
   }
 }
 /* ---------- Range Sweep strategy (impulse -> correction -> sweep -> back into the range) ---------- */
-let rsSeries = [], rsKey = '', lastRS = null, showRS = ls('rs', '1') !== '0';
+let rsSeries = [], rsKey = '', lastRS = null, showRS = false;
 function clearRS(){
   rsSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
   rsSeries = []; rsKey = ''; const b = $('rsbox'); if (b) b.innerHTML = '';
@@ -2919,7 +2916,7 @@ function fibParse(str){
   return u.length ? u : [0.5, 0.618];
 }
 let fibLv = fibParse(ls('fibl', '0.5, 0.618'));
-let fibChart = ls('fibc', '1') !== '0', fibLines = [], fibSeries = [], fibKey = '', lastFibChart = null, lastFib = null;
+let fibChart = false, fibLines = [], fibSeries = [], fibKey = '', lastFibChart = null, lastFib = null;
 function fibPrice(sw, r){ return sw.dir === 'up' ? sw.hi - r * (sw.hi - sw.lo) : sw.lo + r * (sw.hi - sw.lo); }
 function clearFibLines(){
   fibLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} }); fibLines = [];
@@ -2953,7 +2950,6 @@ function drawFibTabs(){
   });
 }
 function drawFib(){
-  $('fibc_btn').textContent = 'Lines on chart: ' + (fibChart ? 'ON' : 'OFF'); $('fibc_btn').className = 'btn' + (fibChart ? ' on' : '');
   if (document.activeElement !== $('fibin')) $('fibin').value = fibLv.join(', ');
   const box = $('fbox'), j = lastFib;
   if (!j) return;
@@ -3076,7 +3072,7 @@ chart.subscribeClick(p => {                                                    /
 });
 
 /* ---------- smart money concepts: order blocks, fair value gaps, premium / discount ---------- */
-let smcSeries = [], smcLines = [], smcKey = '', lastSMC = null, showSMC = ls('sm', '1') !== '0';
+let smcSeries = [], smcLines = [], smcKey = '', lastSMC = null, showSMC = false;
 function clearSMC(){
   smcSeries.forEach(x => { try { chart.removeSeries(x); } catch(e){} });
   smcLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} });
@@ -3095,7 +3091,6 @@ function zone(t0, t1, lo, hi, rgb, a, label, border, bag){
 }
 function drawSMC(sm){
   lastSMC = sm;
-  $('b_smc').className = 'btn' + (showSMC ? ' on' : '');
   const key = showSMC ? (sym + tf + JSON.stringify(sm)) : 'off';
   if (key === smcKey) return;
   clearSMC(); smcKey = key;

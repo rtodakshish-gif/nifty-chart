@@ -2344,10 +2344,10 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
         ti = t[f["i"]]
         if f["buy"]:
             markers.append(dict(time=ti, position="belowBar", shape="arrowUp",
-                                color="#00c853" if f["ok"] else "#6b8f71", text="BUY" if f["ok"] else "buy"))
+                                color="#00c853" if f["ok"] else "#2196f3", text="BUY" if f["ok"] else "buy"))
         else:
             markers.append(dict(time=ti, position="aboveBar", shape="arrowDown",
-                                color="#ff1744" if f["ok"] else "#9a6b6b", text="SELL" if f["ok"] else "sell"))
+                                color="#ff1744" if f["ok"] else "#2196f3", text="SELL" if f["ok"] else "sell"))
     for tr in trades:                    # simulated exits that are not a plain flip
         if tr["j"] is not None and tr["why"] in ("SL", "EOD"):
             markers.append(dict(time=t[tr["j"]], position="inBar", color="#b0bec5", shape="circle", text=tr["why"]))
@@ -2600,7 +2600,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="biasbox"></div>
     <div id="sigs"></div>
     <div class="how">
-      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. <b>15m chart:</b> BUY / SELL (big) shows only when 1H and 4H are both bullish (BUY) or both bearish (SELL) when the signal comes; the Sim line and the Journal follow the same rule. Signals that the filter blocks are shown dim (buy / sell). The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
+      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (small, blue)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. <b>15m chart:</b> BUY / SELL (big) shows only when 1H and 4H are both bullish (BUY) or both bearish (SELL) when the signal comes; the Sim line and the Journal follow the same rule. Signals that the filter blocks are shown in BLUE (small buy / sell) - only a real setup is green (BUY) or red (SELL). The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>

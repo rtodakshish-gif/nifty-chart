@@ -525,8 +525,8 @@ def supertrend(df):
     return d, np.where(d == 1, flb, fub)
 
 
-def simulate(df, d, intraday):
-    """Enter on a Supertrend flip confirmed by EMA20; exit on opposite flip, SL, or (intraday) end of day."""
+def simulate(df, d, intraday, confirm=True):
+    """Enter on a signal flip (Supertrend flip confirmed by EMA20, or a CHoCH when confirm=False); exit on opposite flip, SL, or (intraday) end of day."""
     close, high, low, ema = df.close.values, df.high.values, df.low.values, df.ema.values
     opn = df.open.values
     tr = pd.concat([df.high - df.low, (df.high - df.close.shift()).abs(),
@@ -536,8 +536,8 @@ def simulate(df, d, intraday):
     trades, i, n = [], 1, len(df)
     while i < n:
         flip = d[i] != d[i - 1]                  # also a flip on the first candle of the day (gap open) is a signal, like on the chart
-        long_ok = flip and d[i] == 1 and close[i] > ema[i]
-        short_ok = flip and d[i] == -1 and close[i] < ema[i]
+        long_ok = flip and d[i] == 1 and (close[i] > ema[i] or not confirm)
+        short_ok = flip and d[i] == -1 and (close[i] < ema[i] or not confirm)
         if not (long_ok or short_ok):
             i += 1
             continue
@@ -988,14 +988,14 @@ def fmt_sig_time(ts, sec):
     return x.strftime("%d-%b") if sec >= 86400 else x.strftime("%d-%b %H:%M")
 
 
-def find_flips(df, d, n_closed, sec):
+def find_flips(df, d, n_closed, sec, confirm=True):
     """Every Supertrend flip on a closed candle. ok = also confirmed by close vs EMA20 (bot rule)."""
     out = []
     for i in range(1, n_closed):
         if d[i] != d[i - 1]:
             buy = bool(d[i] == 1)
             c, e = float(df.close[i]), float(df.ema[i])
-            out.append(dict(i=i, buy=buy, ok=(c > e) if buy else (c < e), price=round(c, 2),
+            out.append(dict(i=i, buy=buy, ok=((c > e) if buy else (c < e)) if confirm else True, price=round(c, 2),
                             time=fmt_sig_time(int(df.time[i]), sec)))
     return out
 
@@ -1475,6 +1475,33 @@ raw = {}                                 # tf -> {"sig": dict, "t": float}   (fo
 sig_lock = threading.Lock()
 
 
+PLAN_CHOCH_TFS = ("15m",)               # these time frames trade CHoCH (change of character): CHoCH up = BUY, CHoCH down = SELL (no EMA20 check)
+
+
+def choch_dir(df, n_closed):
+    """+1 / -1 array: the direction of the latest CHoCH on closed candles (a BOS does not change it). Its flips are exactly the CHoCH candles."""
+    ms = market_structure(df, n_closed, [int(x) for x in df.time.values], 5)
+    chs = [e for e in ms["_all"] if e["kind"] == "CHoCH"]
+    d = np.ones(len(df))
+    if not chs:
+        return d
+    d[:] = -1 if chs[0]["up"] else 1                  # before the first CHoCH: the opposite side, so the first CHoCH is a flip too
+    for e in chs:
+        d[e["i1"]:] = 1 if e["up"] else -1
+    return d
+
+
+def signal_dir(df, tf, n_closed):
+    """(direction array that makes the BUY / SELL signals, must close vs EMA20 confirm?)"""
+    if tf in PLAN_CHOCH_TFS:
+        return choch_dir(df, n_closed), False
+    return supertrend(df)[0], True
+
+
+def sig_name(tf):
+    return "opposite CHoCH" if tf in PLAN_CHOCH_TFS else "Supertrend flip"
+
+
 def tf_signal(tf, sym=DEFAULT_SYM):
     """Latest signal of one time frame (data cached 30 s)."""
     c = raw.get((sym, tf))
@@ -1482,10 +1509,10 @@ def tf_signal(tf, sym=DEFAULT_SYM):
         interval, rng, sec = TFS[tf]
         df = fetch(tf, sym)
         df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
-        d, _ = supertrend(df)
         now = int(time.time())
         n_closed = closed_count(df, sec, now)
-        flips = find_flips(df, d, n_closed, sec)
+        d, cf = signal_dir(df, tf, n_closed)
+        flips = find_flips(df, d, n_closed, sec, cf)
         sig = dict(tf=tf, trend="GREEN" if d[-1] == 1 else "RED",
                    signal=(dict(side="BUY" if flips[-1]["buy"] else "SELL", ok=flips[-1]["ok"],
                                 price=flips[-1]["price"], time=flips[-1]["time"]) if flips else None))
@@ -1669,7 +1696,6 @@ def bias_text(b):
 
 
 PLAN_TFS = ("15m", "30m", "1h")
-PLAN_CHOCH_TFS = ("15m",)               # these plans enter on a CHoCH (change of character) instead of a Supertrend flip
 
 
 def make_plan(tf=PLAN_TF):
@@ -1680,27 +1706,22 @@ def make_plan(tf=PLAN_TF):
     sec = TFS[tf][2]
     df = fetch(tf)
     df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
-    d, _ = supertrend(df)
     trr = pd.concat([df.high - df.low, (df.high - df.close.shift()).abs(),
                      (df.low - df.close.shift()).abs()], axis=1).max(axis=1)
     atr = trr.rolling(14, min_periods=1).mean().values
     now = int(time.time())
     n_closed = closed_count(df, sec, now)
-    flips = find_flips(df, d, n_closed, sec)
+    d, cf = signal_dir(df, tf, n_closed)
+    flips = find_flips(df, d, n_closed, sec, cf)
     spot = float(df.close.iloc[-1])
     out = dict(tf=tf, spot=round(spot, 2), trend="GREEN" if d[-1] == 1 else "RED", signal=None, plan=None,
                lot=LOT, active=False, bias=None, filter=TREND_FILTER, src="ST")
     if tf in PLAN_CHOCH_TFS:
-        # CHoCH plan: a close above the last swing high after a down-trend (CHoCH up) = BUY ; a close below the last swing low after an up-trend (CHoCH down) = SELL.
-        # BOS (trend continues) is not an entry. The newest CHoCH is the signal until the opposite CHoCH comes.
+        # CHoCH plan: a close above the last swing high after a down-trend (CHoCH up) = BUY ; below the last swing low after an up-trend (CHoCH down) = SELL.
         out["src"] = "CHoCH"
-        ms = market_structure(df, n_closed, [int(x) for x in df.time.values], 5)
-        chs = [e for e in ms["_all"] if e["kind"] == "CHoCH"]
-        flips = []
-        if chs:
-            e = chs[-1]
-            flips = [dict(i=e["i1"], buy=bool(e["up"]), ok=True, price=round(float(df.close[e["i1"]]), 2),
-                          time=fmt_sig_time(int(df.time[e["i1"]]), sec), level=e["price"])]
+        lv = {e["i1"]: e["price"] for e in market_structure(df, n_closed, [int(x) for x in df.time.values], 5)["_all"] if e["kind"] == "CHoCH"}
+        for f in flips:
+            f["level"] = lv.get(f["i"])
     if flips:
         f = flips[-1]
         close_ts = int(df.time[f["i"]]) + sec
@@ -1785,11 +1806,11 @@ def journal_trades(tf):
     sec = TFS[tf][2]
     df = fetch(tf, DEFAULT_SYM)
     df["ema"] = df.close.ewm(span=EMA_LEN, adjust=False).mean()
-    d, _ = supertrend(df)
     n_closed = closed_count(df, sec, int(time.time()))
+    d, cf = signal_dir(df, tf, n_closed)
     closed = df.iloc[:n_closed].reset_index(drop=True)
     out = []
-    for x in simulate(closed, d[:n_closed], sec < 86400):
+    for x in simulate(closed, d[:n_closed], sec < 86400, cf):
         src = "ST"
         i, j = x["i"], x["j"]
         ts = int(closed.time[i])
@@ -1797,7 +1818,7 @@ def journal_trades(tf):
         if j == i or (tc + SHIFT) % 86400 >= 15 * 3600 + 1800:
             continue                         # signal on the last candle of the day: no time left to trade it
         pts = (x["exit"] - x["entry"]) * x["side"]
-        rec = dict(tf=tf, src=src, side="BUY" if x["side"] == 1 else "SELL", ts=ts, tc=tc, t_in=fmt_sig_time(ts, sec),
+        rec = dict(tf=tf, src=src, sig="CHoCH" if tf in PLAN_CHOCH_TFS else "ST", side="BUY" if x["side"] == 1 else "SELL", ts=ts, tc=tc, t_in=fmt_sig_time(ts, sec),
                    px_in=round(float(x["entry"]), 2), sl=round(float(x["sl"]), 2), status="open" if j is None else "closed",
                    why="OPEN" if j is None else x["why"], t_out=None, tc_out=None,
                    px_out=round(float(x["exit"]), 2), pts=round(float(pts), 2),
@@ -1815,6 +1836,8 @@ def journal_update(tf):
     with jlock:
         tr = journal["trades"]
         for k in [k for k, v in tr.items() if v.get("src") == "EMA"]:      # the EMA BUY strategy was removed: drop its old trades
+            del tr[k]
+        for k in [k for k, v in tr.items() if v["tf"] in PLAN_CHOCH_TFS and v.get("sig") != "CHoCH"]:   # 15m now trades CHoCH: old Supertrend trades are not comparable
             del tr[k]
         seen_keys = set()
         for rec in new:
@@ -1883,14 +1906,14 @@ def alert_entry(rec, bias=None):
     side, tf = rec["side"], rec["tf"]
     sl = f"Nifty stop-loss ~{rec.get('sl') or 0:.0f} ({SL_LABEL})"
     body = (f"{side} signal {tf} ({rec['t_in']}) | Nifty {rec['px_in']:.2f}\n"
-            f"{sl}. Exit: {tf} Supertrend flips back (you get an alert) or your premium stop-loss.")
+            f"{sl}. Exit: {sig_name(tf)} on {tf} (you get an alert) or your premium stop-loss.")
     try:                                # SELL signal -> sell CE + buy far CE ; BUY signal -> sell PE + buy far PE
         pl = option_plan(rec["px_in"], call=(side == "SELL"))
         body = (f"{side} signal {tf} ({rec['t_in']}) | Nifty {rec['px_in']:.2f}\n"
                 f"SELL {pl['sell_strike']} {pl['kind']} (~Rs {pl['sell_prem']}) + BUY {pl['hedge_strike']} "
                 f"{pl['kind']} (~Rs {pl['hedge_prem']}) | Expiry {pl['expiry']}\n"
                 f"Credit ~Rs {pl['credit']:,}, max loss ~Rs {pl['max_loss']:,} (1 lot)\n"
-                f"SL: premium Rs {pl['sl_prem']} | {sl} or {tf} Supertrend flip (alert comes). "
+                f"SL: premium Rs {pl['sl_prem']} | {sl} or {sig_name(tf)} on {tf} (alert comes). "
                 f"Premiums are estimates, check real prices in Kite.")
     except Exception:
         pass
@@ -1909,7 +1932,7 @@ def candle_close_ts(ts, sec):
 
 
 def alert_exit(rec):
-    body = (f"{rec['side']} trade on {rec['tf']} is over ({rec['t_out']}): Supertrend flipped back | "
+    body = (f"{rec['side']} trade on {rec['tf']} is over ({rec['t_out']}): {sig_name(rec['tf'])} | "
             f"Nifty {rec['px_out']:.2f} (entry {rec['px_in']:.2f}, {rec['pts']:+.0f} pts). Close the option positions.")
     ntfy(f"NIFTY {rec['tf']} EXIT", body, "high", "checkered_flag")
 
@@ -2246,7 +2269,8 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     now = int(time.time())
     n_closed = closed_count(df, sec, now)
     closed = df.iloc[:n_closed].reset_index(drop=True)
-    trades = simulate(closed, d[:n_closed], intraday)
+    dsig, cf = signal_dir(df, tf, n_closed)                  # BUY / SELL signals: Supertrend flip (+EMA20), or a CHoCH on 15m
+    trades = simulate(closed, dsig[:n_closed], intraday, cf)
 
     t = (df["time"] + SHIFT).tolist()
     candles = [dict(time=t[i], open=round(float(df.open[i]), 2), high=round(float(df.high[i]), 2),
@@ -2256,7 +2280,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
     st_dn = [dict(time=t[i], value=round(float(line[i]), 2)) if d[i] == -1 else dict(time=t[i]) for i in range(len(df))]
 
     # signals: every Supertrend flip on a closed candle (bright = EMA20-confirmed = bot rule, dim = not confirmed)
-    flips = find_flips(df, d, n_closed, sec)
+    flips = find_flips(df, dsig, n_closed, sec, cf)
     markers = []
     for f in flips:
         ti = t[f["i"]]
@@ -2281,7 +2305,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
             eq += p
             peak = max(peak, eq)
             dd = min(dd, eq - peak)
-        summary = (f"Sim {tf}, SL {SL_LABEL}: {len(pts)} trades, win {wins / len(pts) * 100:.0f}%, "
+        summary = (f"Sim {tf}{' CHoCH' if tf in PLAN_CHOCH_TFS else ''}, SL {SL_LABEL}: {len(pts)} trades, win {wins / len(pts) * 100:.0f}%, "
                    f"total {sum(pts):+.0f} pts ({sum(pct):+.2f}%), max drawdown {dd:.0f} pts (~Rs {abs(dd) * LOT:,.0f} on 1 lot = {abs(dd) * LOT / CAPITAL * 100:.1f}% of capital), no costs")
     else:
         summary = f"Sim {tf}: no completed trades in this period"
@@ -2519,7 +2543,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="biasbox"></div>
     <div id="sigs"></div>
     <div class="how">
-      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes.</p>
+      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. <b>15m chart is different:</b> BUY = CHoCH up (a candle closes above the last swing high after a down-trend), SELL = CHoCH down - no Supertrend and no EMA20 check. The Sim line, the Journal and the Plan 15m tab use the same CHoCH signals; exit = opposite CHoCH or the 1.5 x ATR stop.</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
@@ -2609,7 +2633,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <h3 style="margin-top:14px">Trades</h3>
     <div id="jlist"></div>
     <div class="how">
-      <p><b>How it works:</b> every EMA20-confirmed Supertrend signal on 15m, 30m and 1h is recorded as a trade. Entry = close of the signal candle. Exit = opposite flip, stop-loss of 1.5 x ATR(14) from the entry price (the SL level is shown on each trade), or day-end close (same rules as the Sim line on the chart). A signal on the last candle of the day is skipped. Results are in Nifty <b>index points</b>, not option rupees.</p>
+      <p><b>How it works:</b> every EMA20-confirmed Supertrend signal on 30m and 1h, and every CHoCH signal on 15m (CHoCH up = BUY, CHoCH down = SELL), is recorded as a trade. Entry = close of the signal candle. Exit = opposite flip, stop-loss of 1.5 x ATR(14) from the entry price (the SL level is shown on each trade), or day-end close (same rules as the Sim line on the chart). A signal on the last candle of the day is skipped. Results are in Nifty <b>index points</b>, not option rupees.</p>
       <p><b>LIVE</b> = this server saw the signal when it came (a real forward test). <b>Backtest</b> = replayed from Yahoo history (15m about 30 days, 30m 60 days, 1h 6 months).</p>
       <p><b>Saving:</b> the journal is a file on the server. Render's free plan wipes that file on every redeploy or restart, so LIVE history can reset. Download it now and then: <a href="/journal.csv" style="color:var(--bl)">Download CSV</a>.</p>
       <div id="jnote"></div>

@@ -2575,7 +2575,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   <section class="view" id="v_chart">
     <div id="ch"><span id="nm">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="mkt"></span></div>
     <div class="scrollx" id="tfs"></div>
-    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button></div>
+    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib Retracement</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button></div>
     <div id="pl">
       <div class="plg">
         <div><label for="pl_e">Entry</label><input id="pl_e" inputmode="decimal" autocomplete="off"></div>
@@ -2601,7 +2601,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="sigs"></div>
     <div class="how">
       <p><b>BUY</b> (green arrow up) / <b>SELL</b> (red arrow down) = every Supertrend flip on a closed candle. All arrows look the same, but the Sim line, the Journal and the trade plans count only the confirmed ones: flip + EMA20 confirmation, and on the 15m chart also 1H + 4H both bullish (BUY) or both bearish (SELL). Signals come only after the candle closes. The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
-      <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame.</p>
+      <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
       <p><b>Planner (button above the chart):</b> plan a trade on the chart. Type Entry, Stop-loss and Target, or press "Tap: Entry / SL / Target" and then tap the chart where you want the line. <b>From signal</b> fills the latest EMA-confirmed Supertrend signal of this time frame: entry = signal close, stop = 1.5 x ATR, target = 2 x risk. The panel shows risk, reward, the risk:reward ratio and your open profit/loss at the live price. Buy or sell is decided by where the stop is (below entry = buy). Lines and boxes are drawn on the chart (red = risk, green = reward). Your plan is saved on this phone, per stock. For Nifty the rupee figure is index points x lot (65); option premiums move differently. It is a planning aid, not advice.</p>
@@ -2619,9 +2619,10 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div class="jbox"><h4>Levels</h4>
       <div class="prow" style="margin-top:6px"><input id="fibin" inputmode="decimal" autocomplete="off" placeholder="0.5, 0.618" onchange="fibSetLv(this.value)"><button class="btn" onclick="fibSetLv('0.5, 0.618')">Reset</button></div>
       <div class="mu" style="margin-top:6px;font-size:12px">Type the levels you want, separated by commas (between 0 and 1.5). Saved on this phone.</div>
+      <div class="seg"><button class="btn" id="fibc_btn" onclick="fibToggleChart()"></button></div>
     </div>
     <div class="how">
-      <p><b>How it works:</b> the app takes the latest confirmed swing high and swing low (a pivot with 5 candles on each side, 3 on the weekly chart) of the time frame you pick. When the low came first (an up-move), the levels are measured down from the high = pullback levels. When the high came first (a down-move), they are measured up from the low = bounce levels. 0.5 and 0.618 are the usual "golden zone" levels. Only closed candles decide the swing, so the levels can move when a new swing forms. A planning aid, not a signal on its own, not advice.</p>
+      <p><b>How it works:</b> the app takes the latest confirmed swing high and swing low (a pivot with 5 candles on each side, 3 on the weekly chart) of the time frame you pick. When the low came first (an up-move), the levels are measured down from the high = pullback levels. When the high came first (a down-move), they are measured up from the low = bounce levels. 0.5 and 0.618 are the usual "golden zone" levels. Only closed candles decide the swing, so the levels can move when a new swing forms. With <b>Lines on chart</b> ON, the levels of the chart's own time frame are drawn as dashed yellow lines. A planning aid, not a signal on its own, not advice.</p>
     </div>
   </div></div></section>
   <section class="view" id="v_plan15"><div class="pad"><div id="plan15"></div></div></section>
@@ -2974,7 +2975,7 @@ function fibParse(str){
   return u.length ? u : [0.5, 0.618];
 }
 let fibLv = fibParse(ls('fibl', '0.5, 0.618'));
-let fibChart = false, fibLines = [], fibSeries = [], fibKey = '', lastFibChart = null, lastFib = null;
+let fibChart = ls('fibc', '1') !== '0', fibLines = [], fibSeries = [], fibKey = '', lastFibChart = null, lastFib = null;
 function fibPrice(sw, r){ return sw.dir === 'up' ? sw.hi - r * (sw.hi - sw.lo) : sw.lo + r * (sw.hi - sw.lo); }
 function clearFibLines(){
   fibLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} }); fibLines = [];
@@ -2983,6 +2984,7 @@ function clearFibLines(){
 function drawFibLines(sw){
   lastFibChart = sw;
   const bf = $('b_fib'); if (bf) bf.className = 'btn' + (fibChart ? ' on' : '');
+  $('fibc_btn').textContent = 'Lines on chart: ' + (fibChart ? 'ON' : 'OFF'); $('fibc_btn').className = 'btn' + (fibChart ? ' on' : '');
   const key = (fibChart && sw) ? (sym + tf + JSON.stringify(sw) + fibLv.join() + ctimes.length) : 'off';
   if (key === fibKey) return;
   clearFibLines(); fibKey = key;

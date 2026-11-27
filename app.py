@@ -5,7 +5,7 @@ Data: free Yahoo Finance (^NSEI). It can be slightly delayed. No API key, no bro
 Time frames: 1m, 5m, 15m, 30m, 1h, 1D, 1W (buttons at the top).
 Shows: candles (incl. the running candle), Supertrend(10,3), EMA20, and BUY/SELL signals on EVERY time frame:
   BIG BUY/SELL  = Supertrend flip confirmed by close vs EMA20 (the bot's rule)
-  small buy/sell = Supertrend flip without EMA20 confirmation (dim)
+  BUY (green) / SELL (red) = every Supertrend flip; Sim / Journal count only the confirmed ones
 plus a 1h hedged option-selling TRADE PLAN card (manual orders; optional ntfy phone alerts), a signal JOURNAL (forward test), a panel with the latest signal of every time frame, and a simulated result (ATR stop-loss, same-day exit).
 Needs: pip install requests pandas numpy      (internet is also needed for the chart library)
 Run:   python nifty_chart_server.py       Stop: Ctrl + C
@@ -2344,10 +2344,10 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
         ti = t[f["i"]]
         if f["buy"]:
             markers.append(dict(time=ti, position="belowBar", shape="arrowUp",
-                                color="#00c853" if f["ok"] else "#6b8f71", text="BUY" if f["ok"] else "buy"))
+                                color="#00c853", text="BUY"))
         else:
             markers.append(dict(time=ti, position="aboveBar", shape="arrowDown",
-                                color="#ff1744" if f["ok"] else "#9a6b6b", text="SELL" if f["ok"] else "sell"))
+                                color="#ff1744", text="SELL"))
     for tr in trades:                    # simulated exits that are not a plain flip
         if tr["j"] is not None and tr["why"] in ("SL", "EOD"):
             markers.append(dict(time=t[tr["j"]], position="inBar", color="#b0bec5", shape="circle", text=tr["why"]))
@@ -2600,7 +2600,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="biasbox"></div>
     <div id="sigs"></div>
     <div class="how">
-      <p><b>BUY / SELL (big)</b> = Supertrend flip + EMA20 confirmed (the bot rule). <b>buy / sell (dim)</b> = flip without EMA20 confirmation. Signals come only after the candle closes. <b>15m chart:</b> BUY / SELL (big) shows only when 1H and 4H are both bullish (BUY) or both bearish (SELL) when the signal comes; the Sim line and the Journal follow the same rule. Signals that the filter blocks are shown dim (buy / sell). The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
+      <p><b>BUY</b> (green arrow up) / <b>SELL</b> (red arrow down) = every Supertrend flip on a closed candle. All arrows look the same, but the Sim line, the Journal and the trade plans count only the confirmed ones: flip + EMA20 confirmation, and on the 15m chart also 1H + 4H both bullish (BUY) or both bearish (SELL). Signals come only after the candle closes. The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>

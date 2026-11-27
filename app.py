@@ -2314,6 +2314,23 @@ def range_sweep(df, n_closed, t, N, atr):
     return dict(setups=keep, end=t[n - 1], idea=idea, stats=dict(n=len(done), wins=wins, pts=round(pts, 1)))
 
 
+FIB_1H_CHART_TFS = ("1m", "5m", "15m", "30m")     # on these charts the Fib Retracement chip uses the swing high / low of the 1 HOUR chart
+
+
+def fib_chart_swing(df, n_closed, tf, sym, sec):
+    """Swing the Fib chip draws on the chart. 1m-30m charts: the 1h swing (same as the Fib tab on 1h), so the golden zone is the 1H zone."""
+    if tf in FIB_1H_CHART_TFS:
+        try:
+            h1 = fetch("1h", sym)
+            sw = fib_swing(h1, closed_count(h1, 3600, int(time.time())), 3, 3600)
+            if sw:
+                sw["src"] = "1h"
+                return sw
+        except Exception as e:
+            print("fib 1h note:", e)
+    return fib_swing(df, n_closed, 3 if sec >= 604800 else 5, sec)
+
+
 def build_json(tf, sym=DEFAULT_SYM, df=None):
     interval, rng, sec = TFS[tf]
     intraday = sec < 86400
@@ -2393,7 +2410,7 @@ def build_json(tf, sym=DEFAULT_SYM, df=None):
                        time=f["time"], lot=LOT, rule=SL_LABEL)
 
     return json.dumps(dict(
-        tf=tf, sym=sym, candles=candles, ema=ema, st_up=st_up, st_dn=st_dn, markers=markers, fib=fib_swing(df, n_closed, 3 if sec >= 604800 else 5, sec),
+        tf=tf, sym=sym, candles=candles, ema=ema, st_up=st_up, st_dn=st_dn, markers=markers, fib=fib_chart_swing(df, n_closed, tf, sym, sec),
         last=make_last(df, d, lag), planner=planner,
         summary=summary, last_signal=last_sig, structure=struct, liquidity=liq, sr=sr, smc=smc, range=rs))
 
@@ -2991,10 +3008,13 @@ function drawFibLines(sw){
   if (!fibChart || !sw || ctimes.length < 2) return;
   const t0 = Math.min(sw.x_lo, sw.x_hi), t1 = ctimes[ctimes.length - 1];   // from the start of the move to the latest candle
   if (!(t0 < t1)) return;
+  const tag = sw.src === '1h' ? ' (1H)' : '';
+  const g1 = fibPrice(sw, 0.5), g2 = fibPrice(sw, 0.618);                          // golden zone 0.5 - 0.618
+  zone(t0, t1, Math.min(g1, g2), Math.max(g1, g2), '255,179,0', 0.22, 'Golden zone' + tag, 'rgba(255,179,0,.8)', fibSeries);
   fibLv.forEach(r => {
     const p = fibPrice(sw, r);
     const sr_ = chart.addLineSeries({color: '#ffb300', lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: true,
-      title: 'Fib ' + r, crosshairMarkerVisible: false});
+      title: 'Fib ' + r + tag, crosshairMarkerVisible: false});
     sr_.setData([{time: t0, value: p}, {time: t1, value: p}]);
     fibSeries.push(sr_);
   });

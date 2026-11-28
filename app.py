@@ -1210,6 +1210,30 @@ def prob_otm(spot, K, T, iv, call):
     return _ncdf(-d2) if call else _ncdf(d2)
 
 
+OC_MAP = {"^NSEI": "NIFTY", "^NSEBANK": "BANKNIFTY"}
+oc_last_real = {}                         # last REAL (NSE) OI walls per symbol, so the chart can still show them when NSE blocks us for a while
+
+
+def oc_sr(sym):
+    """Option chain support / resistance for the chart: the OI walls (most Call OI above the spot = resistance, most Put OI below = support)."""
+    ocs = OC_MAP.get(sym)
+    if not ocs:
+        return dict(ok=False, why="Option chain walls are available for Nifty 50 and Bank Nifty only.")
+    j = oc_view(ocs)
+    S = j.get("summary") or {}
+    if j.get("src") == "NSE" and S:
+        oc_last_real[ocs] = dict(S=S, expiry=j["expiry"], time=j["time"], spot=j["spot"], ts=time.time())
+        return dict(ok=True, live=True, name=j["name"], expiry=j["expiry"], time=j["time"], spot=j["spot"], pcr=S.get("pcr"), pain=S.get("pain"),
+                    res=S["res_l"], sup=S["sup_l"])
+    last = oc_last_real.get(ocs)
+    if last and time.time() - last["ts"] < 36 * 3600:
+        S = last["S"]
+        return dict(ok=True, live=False, name=j["name"], expiry=last["expiry"], time=last["time"], spot=last["spot"], pcr=S.get("pcr"), pain=S.get("pain"),
+                    res=S["res_l"], sup=S["sup_l"])
+    return dict(ok=False, why="NSE is not sending Open Interest right now (it often blocks cloud servers), so there are no real option-chain walls. The Options tab shows an ESTIMATE only.",
+                note=j.get("note"))
+
+
 def oc_reco(rows, spot, expiry, bias, S, src):
     """Hedged option-selling ideas from the chain. For each side up to two ideas:
     'wall'  = the strike AT / BEYOND an OI wall (the price must break the wall first; the premium is lower),
@@ -2592,7 +2616,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
   <section class="view" id="v_chart">
     <div id="ch"><span id="nm">NIFTY 50</span><b id="price">loading...</b><span id="chg"></span><span id="mkt"></span></div>
     <div class="scrollx" id="tfs"></div>
-    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib Retracement</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button></div>
+    <div class="scrollx"><button class="btn" id="b_ref" onclick="hardRefresh()">&#8635; Refresh</button><button class="btn" id="b_str" onclick="toggleStruct()">Structure</button><button class="btn" id="b_sr" onclick="toggleSR()">Support/Resistance</button><button class="btn" id="b_fib" onclick="fibToggleChart()">Fib Retracement</button><button class="btn" id="b_os" onclick="toggleOS()">Option Chain S&amp;R</button><button class="btn" id="b_pl" onclick="togglePlanner()">Planner</button></div>
     <div id="pl">
       <div class="plg">
         <div><label for="pl_e">Entry</label><input id="pl_e" inputmode="decimal" autocomplete="off"></div>
@@ -2609,6 +2633,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="bias"></div>
     <div id="hunt"></div>
     <div id="rsbox"></div>
+    <div id="osbox" class="mu" style="font-size:12.5px;padding:2px 14px 0"></div>
     <div id="chart"></div>
     <div id="foot"><span id="sum"></span> <span id="upd"></span></div>
   </section>
@@ -2617,7 +2642,7 @@ h3{margin:0 0 10px;font-size:14px;font-weight:500;color:var(--st)}
     <div id="biasbox"></div>
     <div id="sigs"></div>
     <div class="how">
-      <p><b>BUY</b> (green arrow up) / <b>SELL</b> (red arrow down) = every Supertrend flip on a closed candle. All arrows look the same, but the Sim line, the Journal and the trade plans count only the confirmed ones: flip + EMA20 confirmation, and on the 15m chart also 1H + 4H both bullish (BUY) or both bearish (SELL). Signals come only after the candle closes. The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
+      <p><b>BUY</b> (green arrow up) / <b>SELL</b> (red arrow down) = every Supertrend flip on a closed candle. All arrows look the same, but the Sim line, the Journal and the trade plans count only the confirmed ones: flip + EMA20 confirmation, and on the 15m chart also 1H + 4H both bullish (BUY) or both bearish (SELL). Signals come only after the candle closes. <b>Option Chain S&amp;R chip:</b> draws the Open Interest walls of the NSE option chain on the chart - red lines = resistance (strikes above the price with the most Call OI), green lines = support (strikes below the price with the most Put OI), purple dashed = max pain. Works for Nifty 50 and Bank Nifty and needs real NSE data; if NSE blocks the server it shows the last real data (with its time) or says it is not available - it never draws estimated walls. The <b>Plan 15m</b> tab is different: it enters only on a CHoCH (CHoCH up = BUY, CHoCH down = SELL).</p>
       <p><b>Fib tab:</b> Fibonacci levels (0.5 and 0.618 by default, you can change them) from the latest swing, for any time frame. The levels of the chart's time frame are also drawn on the chart as dashed yellow lines along the latest move (from its start to now). Use the <b>Fib</b> button above the chart to switch them on or off.</p>
       <p><b>Structure:</b> BOS = close breaks the last swing high/low (trend continues). CHoCH = break against the earlier trend (possible reversal). Dashed grey lines = latest unbroken swing high/low.</p>
       <p><b>Demand / Supply zones (inside Support/Resistance):</b> green box = demand: price stayed in a tight range (consolidation) and then jumped UP out of it, so buyers may defend it again. Red box = supply: tight range, then a big drop. The box is the consolidation range. Dim = price already came back once (tested). It disappears when a candle closes through it. Zones are <b>always taken from the 1-hour chart</b>, on every time frame (1m ... 1M). A zone shows <b>as soon as the breakout happens</b>, even while the 1-hour candle is still running (it is rechecked every 10 seconds). If that candle then falls back, the zone can disappear again.</p>
@@ -3021,6 +3046,39 @@ function drawFibLines(sw){
 }
 function fibSetLv(v){ fibLv = fibParse(v); const t = fibLv.join(', '); ss('fibl', t); $('fibin').value = t; fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
 function fibToggleChart(){ fibChart = !fibChart; ss('fibc', fibChart ? '1' : '0'); fibKey = ''; drawFibLines(lastFibChart); drawFib(); }
+/* ---------- Option chain S&R: OI walls (most Call OI above the price = resistance, most Put OI below = support) ---------- */
+let showOS = ls('os', '0') === '1', osLines = [], osKey = '', lastOS = null;
+function clearOS(){ osLines.forEach(x => { try { candles.removePriceLine(x); } catch(e){} }); osLines = []; osKey = ''; }
+function fmtL(v){ return v >= 1e5 ? (v / 1e5).toFixed(1) + 'L' : (v / 1e3).toFixed(0) + 'K'; }
+function drawOS(j){
+  lastOS = j;
+  const b = $('b_os'); if (b) b.className = 'btn' + (showOS ? ' on' : '');
+  const box = $('osbox');
+  if (!showOS){ if (box) box.innerHTML = ''; clearOS(); return; }
+  if (!j){ box.innerHTML = 'Option chain S&amp;R: loading...'; return; }
+  if (!j.ok){ clearOS(); box.innerHTML = '<span style="color:var(--or)">Option chain S&amp;R: ' + (j.why || 'not available') + '</span>'; return; }
+  box.innerHTML = '<b>Option chain S&amp;R</b> - ' + j.name + ', expiry ' + j.expiry + ' | ' + (j.live ? 'NSE live ' + j.time : '<span style="color:var(--or)">last real NSE data ' + j.time + ' (NSE not answering now)</span>')
+    + ' | PCR ' + (j.pcr == null ? '-' : j.pcr) + ' | Max pain ' + (j.pain == null ? '-' : fmt(j.pain)) + '<br><span class="mu">Red = Call OI walls (resistance), green = Put OI walls (support). Number = open interest (L = lakh).</span>';
+  const key = JSON.stringify([sym, j.res, j.sup, j.pain]);
+  if (key === osKey) return;
+  clearOS(); osKey = key;
+  const add = (price, col, w, st, title) => osLines.push(candles.createPriceLine({price: price, color: col, lineWidth: w, lineStyle: st, axisLabelVisible: true, title: title, axisLabelColor: col, axisLabelTextColor: '#ffffff'}));
+  (j.res || []).forEach((w, i) => add(w.strike, '#d32f2f', w.strong ? 2 : 1, 0, 'OC R' + (i + 1) + ' ' + fmtL(w.oi)));
+  (j.sup || []).forEach((w, i) => add(w.strike, '#2e7d32', w.strong ? 2 : 1, 0, 'OC S' + (i + 1) + ' ' + fmtL(w.oi)));
+  if (j.pain) add(j.pain, '#8e24aa', 1, 2, 'Max pain');
+}
+function toggleOS(){ showOS = !showOS; ss('os', showOS ? '1' : '0'); osKey = ''; if (showOS && !lastOS) loadOS(); drawOS(lastOS); }
+async function loadOS(){
+  if (!showOS) return;
+  const ws = sym;
+  try{
+    const j = await (await fetch('/ocsr?sym=' + encodeURIComponent(ws) + '&_=' + Date.now())).json();
+    if (ws !== sym) return;
+    drawOS(j);
+  } catch(e){ if (!lastOS) drawOS({ok: false, why: 'connection problem, try again.'}); }
+}
+setInterval(() => { if (showOS && view === 'chart') loadOS(); }, 30000);
+if (showOS) setTimeout(loadOS, 1500);
 function drawFibTabs(){
   const box = $('ftf'); box.innerHTML = '';
   FTFS.forEach(x => {
@@ -3597,9 +3655,9 @@ function selectSym(s){
   sym = s; ss('nsym', s);
   for (const k in dcache) delete dcache[k];
   setLoading(true, tf);
-  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearPL(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
+  first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearOS(); lastOS = null; clearPL(); plLoad(); lastPlanner = null; lastPx = null; ctimes = []; pickMode = null; plSync();
   $('nm').textContent = nm(s); $('price').textContent = '...'; $('chg').textContent = '';
-  renderWatch(); setView('chart');
+  renderWatch(); setView('chart'); loadOS();
   bias = null; drawBias(); loadBias(); tick(); loadSigs(); loadPlan(); loadNews();
 }
 
@@ -3646,7 +3704,7 @@ async function tick(){
   try { await tickInner(); } finally { if (busy === key) busy = ''; }
 }
 function hardRefresh(){
-  forceNext = true; first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearPL();
+  forceNext = true; first = true; lastT = 0; clearStructure(); clearLiquidity(); clearSR(); clearFibLines(); clearSMC(); clearRS(); clearOS(); lastOS = null; clearPL();
   $('upd').textContent = 'refreshing...';
   tick(); loadSigs(true); loadPlan(true); loadBias(true); loadQuotes();
 }
@@ -3714,6 +3772,7 @@ function renderData(j, want, ws){
   drawSR(j.sr);
   drawSMC(j.smc);
   drawRS(j.range);
+  drawOS(lastOS);
   drawFibLines(j.fib);
   lastPlanner = j.planner; plInfo();
   if (Date.now() - liveOk > 3000) applyLast(j.last, ws);
@@ -4743,6 +4802,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(fib_view(q.get("tf", ["1h"])[0], clean_sym(q.get("sym", [DEFAULT_SYM])[0]))).encode("utf-8")
             except Exception as e:
                 body = json.dumps({"error": str(e)}).encode("utf-8")
+            self._send(200, "application/json", body)
+        elif u.path == "/ocsr":
+            q = parse_qs(u.query)
+            try:
+                body = json.dumps(oc_sr(clean_sym(q.get("sym", [DEFAULT_SYM])[0]))).encode("utf-8")
+            except Exception as e:
+                body = json.dumps({"ok": False, "why": "Could not load (%s)" % str(e)[:80]}).encode("utf-8")
             self._send(200, "application/json", body)
         elif u.path == "/bias":
             q = parse_qs(u.query)
